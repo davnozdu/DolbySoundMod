@@ -155,10 +155,81 @@ public class AllySoundCtl {
         }
     }
 
+    private static int intAfter(String line, String key) {
+        int at = line.indexOf(key);
+        if (at < 0) return -1;
+        int i = at + key.length();
+        while (i < line.length() && !Character.isDigit(line.charAt(i))) i++;
+        int start = i;
+        while (i < line.length() && Character.isDigit(line.charAt(i))) i++;
+        if (i == start) return -1;
+        try {
+            return Integer.parseInt(line.substring(start, i));
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    /** Package name of a running process: for an app its cmdline is the package name. */
+    private static String packageOfPid(int pid) {
+        try {
+            byte[] raw = java.nio.file.Files.readAllBytes(java.nio.file.Paths.get("/proc/" + pid + "/cmdline"));
+            String all = new String(raw, "UTF-8").replace('\0', '\n').trim();
+            if (all.isEmpty()) return null;
+            String first = all.split("\n")[0].trim();
+            return first.isEmpty() ? null : first;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Sessions AudioFlinger is currently mixing audio for.
+     *
+     * The flinger's own "Global session refs" table is the obvious source but it is empty on
+     * this device whenever the track is on an offload or direct output, and it also lists our
+     * own AudioEffect as a "root" client of the very session we are about to attach to. The
+     * audio service keeps the authoritative list of started tracks (with their session ids and
+     * owning pid), so that is the primary source; the flinger table is only the fallback.
+     */
     private static Map<Integer, String> readActiveSessions() {
         Map<Integer, String> sessions = new HashMap<>();
         try {
+            Process p = Runtime.getRuntime().exec(new String[]{"dumpsys", "audio"});
+            BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()));
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (!line.contains("state:started")) continue;
+                int sid = intAfter(line, "sessionId:");
+                // "u/pid:10206/6523" is uid/pid; the pid is what /proc knows about.
+                int upid = line.indexOf("u/pid:");
+                int pid = -1;
+                if (upid >= 0) {
+                    int slash = line.indexOf('/', upid);
+                    if (slash > 0) {
+                        int i = slash + 1;
+                        int start = i;
+                        while (i < line.length() && Character.isDigit(line.charAt(i))) i++;
+                        if (i > start) {
+                            try {
+                                pid = Integer.parseInt(line.substring(start, i));
+                            } catch (NumberFormatException ignored) {}
+                        }
+                    }
+                }
+                if (sid <= 0 || pid <= 0) continue;
+                String pkg = packageOfPid(pid);
+                if (pkg != null && pkg.contains(".") && !sessions.containsKey(sid)) {
+                    sessions.put(sid, pkg);
+                }
+            }
+            p.destroy();
+        } catch (Exception ignored) {}
+        if (!sessions.isEmpty()) return sessions;
+
+        try {
             Process p = Runtime.getRuntime().exec(new String[]{"dumpsys", "media.audio_flinger"});
+
             BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()));
             String line;
             boolean inGlobal = false;
