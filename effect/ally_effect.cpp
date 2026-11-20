@@ -95,7 +95,7 @@ Descriptor make_descriptor(const AudioUuid& impl) {
 
 class AllySoundEffect final : public BnEffect {
 public:
-    AllySoundEffect() = default;
+    explicit AllySoundEffect(const AudioUuid& impl) : impl_uuid_(impl) {}
     ~AllySoundEffect() override {
         stop_worker();
     }
@@ -150,7 +150,7 @@ public:
     }
 
     ndk::ScopedAStatus getDescriptor(Descriptor* _aidl_return) override {
-        *_aidl_return = make_descriptor();
+        *_aidl_return = make_descriptor(impl_uuid_);
         return ndk::ScopedAStatus::ok();
     }
 
@@ -225,6 +225,7 @@ public:
     }
 
 private:
+    AudioUuid impl_uuid_;
     std::mutex mutex_;
     std::atomic<State> state_{State::INIT};
     std::atomic<ally::Profile> profile_{ally::Profile::Game};
@@ -376,7 +377,7 @@ extern "C" binder_status_t queryEffect(
     const aidl::android::media::audio::common::AudioUuid* in_impl_uuid,
     aidl::android::hardware::audio::effect::Descriptor* _aidl_return) {
     if (!in_impl_uuid || !_aidl_return) return STATUS_BAD_VALUE;
-    if (!is_known_uuid(*in_impl_uuid)) return STATUS_NAME_NOT_FOUND;
+    if (!aidl::android::hardware::audio::effect::is_known_uuid(*in_impl_uuid)) return STATUS_NAME_NOT_FOUND;
     *_aidl_return = aidl::android::hardware::audio::effect::make_descriptor(*in_impl_uuid);
     return STATUS_OK;
 }
@@ -385,8 +386,8 @@ extern "C" binder_status_t createEffect(
     const aidl::android::media::audio::common::AudioUuid* in_impl_uuid,
     std::shared_ptr<aidl::android::hardware::audio::effect::IEffect>* _aidl_return) {
     if (!in_impl_uuid || !_aidl_return) return STATUS_BAD_VALUE;
-    if (!is_known_uuid(*in_impl_uuid)) return STATUS_NAME_NOT_FOUND;
-    auto inst = ndk::SharedRefBase::make<aidl::android::hardware::audio::effect::AllySoundEffect>();
+    if (!aidl::android::hardware::audio::effect::is_known_uuid(*in_impl_uuid)) return STATUS_NAME_NOT_FOUND;
+    auto inst = ndk::SharedRefBase::make<aidl::android::hardware::audio::effect::AllySoundEffect>(*in_impl_uuid);
     {
         std::lock_guard<std::mutex> lock(aidl::android::hardware::audio::effect::g_instances_mutex);
         aidl::android::hardware::audio::effect::g_instances.push_back(inst);
