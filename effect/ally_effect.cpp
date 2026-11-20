@@ -63,10 +63,25 @@ int channel_count_from_layout(const AudioChannelLayout& layout) {
     return 2;
 }
 
-Descriptor make_descriptor() {
+// Oplus "audiox" effect uuid (41f6c0f4-5d8f-11ec-bf63-0242ac130002): the vendor
+// HAL only creates effects it can load through its own library list, so the
+// module also ships this library under the Oplus name and answers for this uuid.
+const AudioUuid kOplusUuid = {
+    static_cast<int32_t>(0x41f6c0f4),
+    0x5d8f,
+    0x11ec,
+    0xbf63,
+    {0x02, 0x42, 0xac, 0x13, 0x00, 0x02},
+};
+
+static bool is_known_uuid(const AudioUuid& u) {
+    return u == kImplUuid || u == kOplusUuid;
+}
+
+Descriptor make_descriptor(const AudioUuid& impl) {
     Descriptor desc;
     desc.common.id.type = kTypeUuid;
-    desc.common.id.uuid = kImplUuid;
+    desc.common.id.uuid = impl;
     desc.common.name = "Ally Sound Lab";
     desc.common.implementor = "AllySoundKSU";
     desc.common.flags.type = Flags::Type::INSERT;
@@ -361,10 +376,8 @@ extern "C" binder_status_t queryEffect(
     const aidl::android::media::audio::common::AudioUuid* in_impl_uuid,
     aidl::android::hardware::audio::effect::Descriptor* _aidl_return) {
     if (!in_impl_uuid || !_aidl_return) return STATUS_BAD_VALUE;
-    if (*in_impl_uuid != aidl::android::hardware::audio::effect::kImplUuid) {
-        return STATUS_NAME_NOT_FOUND;
-    }
-    *_aidl_return = aidl::android::hardware::audio::effect::make_descriptor();
+    if (!is_known_uuid(*in_impl_uuid)) return STATUS_NAME_NOT_FOUND;
+    *_aidl_return = aidl::android::hardware::audio::effect::make_descriptor(*in_impl_uuid);
     return STATUS_OK;
 }
 
@@ -372,9 +385,7 @@ extern "C" binder_status_t createEffect(
     const aidl::android::media::audio::common::AudioUuid* in_impl_uuid,
     std::shared_ptr<aidl::android::hardware::audio::effect::IEffect>* _aidl_return) {
     if (!in_impl_uuid || !_aidl_return) return STATUS_BAD_VALUE;
-    if (*in_impl_uuid != aidl::android::hardware::audio::effect::kImplUuid) {
-        return STATUS_NAME_NOT_FOUND;
-    }
+    if (!is_known_uuid(*in_impl_uuid)) return STATUS_NAME_NOT_FOUND;
     auto inst = ndk::SharedRefBase::make<aidl::android::hardware::audio::effect::AllySoundEffect>();
     {
         std::lock_guard<std::mutex> lock(aidl::android::hardware::audio::effect::g_instances_mutex);

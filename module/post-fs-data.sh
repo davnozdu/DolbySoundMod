@@ -172,7 +172,37 @@ patch_sku_effects() {
     done
 }
 
+# Take over the Oplus "audiox" effect slot. The vendor effect HAL only ever loads
+# the libraries from its own list (it ignores anything added to the config), so the
+# only way in is to hand it our binary under a name it already loads.
+stage_odm_soundfx() {
+    SRC=/odm/lib64/soundfx
+    [ -d "$SRC" ] || { log "no $SRC"; return 0; }
+    OURS="$MODDIR/vendor/lib64/soundfx/libOplusAudioxAidl.so"
+    [ -f "$OURS" ] || { log "no $OURS"; return 0; }
+    OSTAGE="$DATA_DIR/odmsfx_stage"
+    rm -rf "$OSTAGE"
+    mkdir -p "$OSTAGE" || return 1
+    ocount=0
+    for f in "$SRC"/*; do
+        [ -f "$f" ] || continue
+        b=$(basename "$f")
+        cp -f "$f" "$OSTAGE/$b" 2>>"$LOG" || return 1
+        chcon u:object_r:vendor_file:s0 "$OSTAGE/$b" 2>/dev/null
+        ocount=$((ocount + 1))
+    done
+    cp -f "$OURS" "$OSTAGE/libOplusAudioxAidl.so" || return 1
+    chmod 0644 "$OSTAGE/libOplusAudioxAidl.so"
+    chcon u:object_r:vendor_file:s0 "$OSTAGE/libOplusAudioxAidl.so" 2>/dev/null
+    if mount --bind "$OSTAGE" "$SRC" 2>>"$LOG"; then
+        log "odm soundfx staged: $ocount stock + allysound as libOplusAudioxAidl.so"
+    else
+        log "odm soundfx bind FAILED"
+    fi
+}
+
 install_model
 stage_soundfx
+stage_odm_soundfx
 patch_sku_effects
 log "post-fs-data done"

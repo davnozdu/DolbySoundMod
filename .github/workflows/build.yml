@@ -181,11 +181,14 @@ jobs:
           sed -i "s/^version=.*/version=${VER_STR}/" dist/module/module.prop
           sed -i "s/^versionCode=.*/versionCode=${VER_CODE}/" dist/module/module.prop
           cp build_arm64/liballysoundaidl.so dist/module/vendor/lib64/soundfx/liballysoundaidl.so
+          # same binary also answers for the Oplus "audiox" uuid: the vendor HAL only
+          # loads libraries from its own list, so we take that slot over
+          cp build_arm64/liballysoundaidl.so dist/module/vendor/lib64/soundfx/libOplusAudioxAidl.so
           cp onnxruntime/jni/arm64-v8a/libonnxruntime.so dist/module/vendor/lib64/libonnxruntime.so
           cp models/vocals.onnx dist/module/vendor/etc/allysound/vocals.onnx
           cp build_java/classes.dex dist/module/bin/AllySoundCtl.dex
           chmod 0755 dist/module/post-fs-data.sh dist/module/service.sh dist/module/uninstall.sh dist/module/bin/check_update.sh
-          chmod 0644 dist/module/vendor/lib64/soundfx/liballysoundaidl.so dist/module/vendor/lib64/libonnxruntime.so dist/module/vendor/etc/allysound/vocals.onnx dist/module/bin/AllySoundCtl.dex
+          chmod 0644 dist/module/vendor/lib64/soundfx/liballysoundaidl.so dist/module/vendor/lib64/soundfx/libOplusAudioxAidl.so dist/module/vendor/lib64/libonnxruntime.so dist/module/vendor/etc/allysound/vocals.onnx dist/module/bin/AllySoundCtl.dex
           (cd dist/module && zip -r9 ../../DolbySoundMod.zip .)
           unzip -l DolbySoundMod.zip | tail -n 15
 
