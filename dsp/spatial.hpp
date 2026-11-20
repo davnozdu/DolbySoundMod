@@ -149,7 +149,13 @@ public:
     DeviceKind device() const { return device_; }
     bool neural() const { return neural_; }
     bool reverb() const { return reverb_; }
-    bool npu_active() const { return vocals_.using_npu(); }
+    bool npu_active() const {
+#ifdef ALLY_ENABLE_NPU
+        return vocals_.using_npu();
+#else
+        return false;
+#endif
+    }
 
     // Process arbitrary number of interleaved float frames (2, 6, or 8 channels).
     // Output is always interleaved stereo float frames.
