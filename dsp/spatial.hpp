@@ -19,6 +19,7 @@ enum class Profile : int {
     Game = 1,
     Movie = 2,
     Music = 3,
+    Speech = 4,  // podcast / audiobook: dry, forward, compression instead of space
 };
 
 enum class DeviceKind : int {
@@ -35,6 +36,7 @@ public:
     void configure_highpass_2nd(float cutoff_hz, float sample_rate, int channels);
     void configure_highpass_1st(float cutoff_hz, float sample_rate, int channels);
     void configure_bandpass_crosstalk(float sample_rate);
+    void configure_high_shelf(float freq_hz, float gain_db, float sample_rate, int channels);
     void reset();
     void process(const float* in, float* out, int ch, int frames);
     void process_inplace(float* buf, int ch, int frames);
@@ -174,6 +176,8 @@ private:
     PipelinedVocals vocals_;
 #endif
     BiquadFilter cinema_air_;
+    BiquadFilter speech_hp_;
+    BiquadFilter speech_presence_;
 
     Convolver direct_;
     Convolver room_;
@@ -215,6 +219,7 @@ private:
     void make_surround_feeds(bool& has_lfe);
     void render_headphones(bool has_lfe, float* out_l, float* out_r);
     void render_speakers(bool has_lfe, float* out_l, float* out_r);
+    void apply_speech_eq(float* out_l, float* out_r);
     void downmix(float* out_l, float* out_r);
 };
 

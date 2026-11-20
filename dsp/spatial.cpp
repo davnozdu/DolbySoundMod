@@ -20,6 +20,7 @@ constexpr float kStereoTrim = 1.6595869f;          // 10^(+4.4/20)
 constexpr float kSpeakerTrimStereo = 0.7762471f;   // 10^(-2.2/20)
 constexpr float kSpeakerTrimSurround = 0.3981072f; // 10^(-8.0/20)
 
+#ifdef ALLY_ENABLE_NPU
 // The model is installed to /data/adb/allysound by post-fs-data.sh; the /vendor
 // path is the fallback for a root manager that does mount module files.
 const char* vocals_model_path() {
@@ -31,6 +32,18 @@ const char* vocals_model_path() {
     }
     return cached;
 }
+// Podcast / audiobook model. A speech model can be dropped in as speech.onnx without
+// touching the code; until then the vocal separator does the job.
+const char* speech_model_path() {
+    static const char* cached = nullptr;
+    if (cached == nullptr) {
+        cached = (access("/data/adb/allysound/speech.onnx", R_OK) == 0)
+                     ? "/data/adb/allysound/speech.onnx"
+                     : vocals_model_path();
+    }
+    return cached;
+}
+#endif
 constexpr float kGlassesBassGain = 0.2589254f;     // 10^(2.0/20) - 1
 
 struct ProfileParams {
@@ -48,6 +61,10 @@ ProfileParams get_profile_params(Profile p) {
             return {1.2589254f, 0.16f, 0.40f, true, 0.48f, 0.42f};
         case Profile::Music:
             return {1.0f, 0.08f, 0.25f, false, 0.38f, 0.32f};
+        case Profile::Speech:
+            // Podcast / audiobook: no room at all, dialogue lifted, stereo narrowed so
+            // the voice stays centred and the compressor does the loudness work.
+            return {1.32f, 0.0f, 0.0f, true, 0.16f, 0.08f};
         case Profile::Game:
         default:
             return {1.0f, 0.10f, 0.22f, false, 0.45f, 0.40f};
@@ -182,6 +199,30 @@ void BiquadFilter::configure_highpass_2nd(float cutoff_hz, float sample_rate, in
         static_cast<float>(((1.0 + c) * 0.5) / a0),
     };
     a_ = {1.0f, static_cast<float>((-2.0 * c) / a0), static_cast<float>((1.0 - alpha) / a0)};
+    channels_ = channels;
+    order_ = 2;
+    state_.assign(channels_ * order_, 0.0f);
+}
+
+void BiquadFilter::configure_high_shelf(float freq_hz, float gain_db, float sample_rate,
+                                       int channels) {
+    const double A = std::pow(10.0, gain_db / 40.0);
+    const double w0 = 2.0 * kPi * freq_hz / sample_rate;
+    const double c = std::cos(w0);
+    const double s = std::sin(w0);
+    const double alpha = s / 2.0 * std::sqrt(2.0);
+    const double two_sqrt_a_alpha = 2.0 * std::sqrt(A) * alpha;
+    const double a0 = (A + 1.0) - (A - 1.0) * c + two_sqrt_a_alpha;
+    b_ = {
+        static_cast<float>((A * ((A + 1.0) + (A - 1.0) * c + two_sqrt_a_alpha)) / a0),
+        static_cast<float>((-2.0 * A * ((A - 1.0) + (A + 1.0) * c)) / a0),
+        static_cast<float>((A * ((A + 1.0) + (A - 1.0) * c - two_sqrt_a_alpha)) / a0),
+    };
+    a_ = {
+        1.0f,
+        static_cast<float>((2.0 * ((A - 1.0) - (A + 1.0) * c)) / a0),
+        static_cast<float>(((A + 1.0) - (A - 1.0) * c - two_sqrt_a_alpha) / a0),
+    };
     channels_ = channels;
     order_ = 2;
     state_.assign(channels_ * order_, 0.0f);
@@ -521,6 +562,10 @@ void Renderer::init(float sample_rate) {
     speaker_lfe_.configure_lowpass_2nd(120.0f, sample_rate, 1);
     glasses_bass_.configure_lowpass_2nd(220.0f, sample_rate, 2);
     cinema_air_.configure_highpass_2nd(4500.0f, sample_rate, 2);
+    // Speech chain: rumble out of the way, presence lifted so consonants cut through
+    // on a phone speaker, nothing added on top.
+    speech_hp_.configure_highpass_2nd(95.0f, sample_rate, 2);
+    speech_presence_.configure_high_shelf(2800.0f, 4.5f, sample_rate, 2);
     widener_.init(sample_rate);
     dynamics_.init(sample_rate);
 
@@ -595,6 +640,18 @@ void Renderer::make_stereo_feeds(bool& has_lfe) {
     std::array<float, 2 * kHop> rear{};
 
 #ifdef ALLY_ENABLE_NPU
+    if (neural_ && profile_ == Profile::Speech &&
+        vocals_.ensure_loaded(speech_model_path(), true)) {
+        // Speech model: keep the voice, tuck everything else away. No room, no air -
+        // the stereo path below only has to place it.
+        std::array<float, 2 * kHop> dry{};
+        std::array<float, 2 * kHop> sep_rest{};
+        vocals_.process(&block_[0], dry.data(), sep_rest.data(), tick_);
+        for (int i = 0; i < 2 * kHop; ++i) {
+            const float voice = dry[i] - sep_rest[i];
+            block_[i] = voice * 1.18f + sep_rest[i] * 0.45f;
+        }
+    }
     if (neural_ && profile_ == Profile::Movie &&
         vocals_.ensure_loaded(vocals_model_path(), true)) {
         std::array<float, 2 * kHop> dry{};
@@ -680,6 +737,16 @@ void Renderer::make_surround_feeds(bool& has_lfe) {
     has_lfe = true;
 }
 
+void Renderer::apply_speech_eq(float* out_l, float* out_r) {
+    if (profile_ != Profile::Speech) return;
+    std::array<float, kHop> tmp{};
+    speech_hp_.process(out_l, tmp.data(), 0, kHop);
+    speech_presence_.process(tmp.data(), out_l, 0, kHop);
+    std::fill(tmp.begin(), tmp.end(), 0.0f);
+    speech_hp_.process(out_r, tmp.data(), 1, kHop);
+    speech_presence_.process(tmp.data(), out_r, 1, kHop);
+}
+
 void Renderer::render_headphones(bool has_lfe, float* out_l, float* out_r) {
     const auto cfg = get_profile_params(profile_);
     direct_.process(feeds_.data(), ears_.data());
@@ -716,6 +783,7 @@ void Renderer::render_headphones(bool has_lfe, float* out_l, float* out_r) {
             out_r[i] += bass_r[i] * kGlassesBassGain;
         }
     }
+    apply_speech_eq(out_l, out_r);
 }
 
 void Renderer::render_speakers(bool has_lfe, float* out_l, float* out_r) {
@@ -758,6 +826,7 @@ void Renderer::render_speakers(bool has_lfe, float* out_l, float* out_r) {
             out_r[i] += l;
         }
     }
+    apply_speech_eq(out_l, out_r);
 }
 
 void Renderer::downmix(float* out_l, float* out_r) {

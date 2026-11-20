@@ -43,6 +43,8 @@ public class AllySoundCtl {
             case "game": return 1;
             case "movie": return 2;
             case "music": return 3;
+            case "podcast":
+            case "speech": return 4;
             default: return 0;
         }
     }
@@ -51,6 +53,7 @@ public class AllySoundCtl {
         switch (p) {
             case 1: return "game";
             case 2: return "movie";
+            case 4: return "podcast";
             case 3: return "music";
             default: return "off";
         }

@@ -18,7 +18,8 @@ int main() {
         in[2 * i + 1] = 0.25f * std::sin(2.0f * 3.14159265f * 550.0f * t);
     }
 
-    for (auto prof : {ally::Profile::Game, ally::Profile::Movie, ally::Profile::Music}) {
+    for (auto prof : {ally::Profile::Game, ally::Profile::Movie, ally::Profile::Music,
+                      ally::Profile::Speech}) {
         for (auto dev : {ally::DeviceKind::Headphones, ally::DeviceKind::Speakers, ally::DeviceKind::Glasses}) {
             r.set_profile(prof);
             r.set_device(dev);

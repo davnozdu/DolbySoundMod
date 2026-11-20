@@ -87,6 +87,7 @@ function renderApps() {
     ['game', 'Игра'],
     ['movie', 'Фильм'],
     ['music', 'Музыка'],
+    ['podcast', 'Подкаст / аудиокнига'],
     ['off', 'Выкл'],
   ];
 
@@ -187,6 +188,7 @@ async function openAppPicker() {
 function guessProfile(pkg) {
   if (pkg.includes('youtube') || pkg.includes('vlc') || pkg.includes('mxtech')) return 'movie';
   if (pkg.includes('spotify') || pkg.includes('music')) return 'music';
+  if (pkg.includes('podcast') || pkg.includes('audiobook') || pkg.includes('audible') || pkg.includes('bookmate')) return 'podcast';
   return 'game';
 }
 

@@ -294,7 +294,7 @@ private:
                 const int n = (rem / 100) % 10;
                 const int r = (rem / 10) % 10;
                 const int d = rem % 10;
-                if (p >= 0 && p <= 3) {
+                if (p >= 0 && p <= 4) {
                     auto prof = static_cast<ally::Profile>(p);
                     profile_.store(prof);
                     renderer_.set_profile(prof);
@@ -316,7 +316,7 @@ private:
                 int p = rem / 100;
                 int n = (rem / 10) % 10;
                 int d = rem % 10;
-                if (p >= 0 && p <= 3) {
+                if (p >= 0 && p <= 4) {
                     auto prof = static_cast<ally::Profile>(p);
                     profile_.store(prof);
                     renderer_.set_profile(prof);
