@@ -164,7 +164,12 @@ public:
     MQDescriptor<T, SynchronizedReadWrite> dup_descriptor() const {
         MQDescriptor<T, SynchronizedReadWrite> desc;
         desc.quantum = static_cast<int32_t>(sizeof(T));
-        desc.flags = 1; // SynchronizedReadWrite
+        // libfmq's MQDescriptor<T, flavor>::isValid() compares this against the
+        // flavor template parameter, where kSynchronizedReadWrite == 0. Sending 1
+        // makes the client build an *unsynchronized* queue, which has no event
+        // flag word - AudioFlinger then reports "<name> invalid efGroup" on every
+        // buffer and never touches our queues.
+        desc.flags = 0; // SynchronizedReadWrite
         desc.grantors.resize(4);
         desc.grantors[0] = {0, 0, 8};
         desc.grantors[1] = {0, 8, 8};
