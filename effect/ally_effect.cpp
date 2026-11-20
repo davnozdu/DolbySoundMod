@@ -80,10 +80,19 @@ static bool is_known_uuid(const AudioUuid& u) {
 
 Descriptor make_descriptor(const AudioUuid& impl) {
     Descriptor desc;
-    desc.common.id.type = kTypeUuid;
+    // The Oplus slot reports itself exactly like the vendor library does: its own uuid is
+    // also its type uuid. AudioFlinger looks effects up by the (type, uuid) pair, so a
+    // different type here makes createEffect fail with -2 even though the uuid matches.
+    if (impl == kOplusUuid) {
+        desc.common.id.type = kOplusUuid;
+        desc.common.name = "OplusAudioX";
+        desc.common.implementor = "Oplus Holdings Corp.";
+    } else {
+        desc.common.id.type = kTypeUuid;
+        desc.common.name = "Ally Sound Lab";
+        desc.common.implementor = "AllySoundKSU";
+    }
     desc.common.id.uuid = impl;
-    desc.common.name = "Ally Sound Lab";
-    desc.common.implementor = "AllySoundKSU";
     desc.common.flags.type = Flags::Type::INSERT;
     desc.common.flags.insert = Flags::Insert::FIRST;
     desc.common.flags.volume = Flags::Volume::NONE;
