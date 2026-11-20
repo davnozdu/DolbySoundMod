@@ -358,10 +358,20 @@ private:
         std::vector<float> out_buf;
 
         uint64_t stat_buffers = 0, stat_timeouts = 0, stat_wait_us = 0, stat_proc_us = 0;
+        int idle_rounds_ = 0;
         auto last_stat = std::chrono::steady_clock::now();
         while (worker_running_.load()) {
             auto t_wait0 = std::chrono::steady_clock::now();
-            if (!in_mq_.wait(1, 20)) stat_timeouts++;
+            // Poll at 1 ms while audio flows, back off to 10 ms once the queue has
+            // been empty for a few rounds: an idle effect must not wake the mixer
+            // thread a thousand times a second.
+            const int wait_ms = idle_rounds_ < 3 ? 1 : 10;
+            if (!in_mq_.wait(1, wait_ms)) {
+                stat_timeouts++;
+                if (idle_rounds_ < 1000) idle_rounds_++;
+            } else {
+                idle_rounds_ = 0;
+            }
             auto t_proc0 = std::chrono::steady_clock::now();
             if (!worker_running_.load()) break;
 
@@ -464,14 +474,9 @@ extern "C" binder_status_t queryEffect(
     aidl::android::hardware::audio::effect::Descriptor* _aidl_return) {
     if (!in_impl_uuid || !_aidl_return) return STATUS_BAD_VALUE;
     if (!aidl::android::hardware::audio::effect::is_known_uuid(*in_impl_uuid)) return STATUS_NAME_NOT_FOUND;
-    if (aidl::android::hardware::audio::effect::is_vendor_slot_uuid(*in_impl_uuid)) {
-        // We are also installed in the vendor Oplus slot so the stock DSP library is
-        // gone, but the effect itself must only run through our own uuid: the vendor
-        // policy attaches that slot to the global output mix without ever opening it,
-        // so a live instance there would just log 'invalid efGroup' for every buffer.
-        ALOGI("declining vendor slot uuid: the effect runs under its own uuid");
-        return STATUS_NAME_NOT_FOUND;
-    }
+    // The vendor slot uuid stays visible here on purpose: the HAL loads this library
+    // through that slot, so declining the descriptor would hide our own uuid too.
+    // Only createEffect refuses it (it must never run a second, never-opened instance).
     *_aidl_return = aidl::android::hardware::audio::effect::make_descriptor(*in_impl_uuid);
     return STATUS_OK;
 }

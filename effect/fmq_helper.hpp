@@ -94,7 +94,9 @@ public:
             return available_to_read() > 0;
         }
         // No event flag on this queue: yield instead of spinning, then report data.
-        usleep(1000);
+        // The caller picks the delay: a millisecond while audio is flowing, longer
+        // once the queue has been idle, so an idle effect does not burn the HAL thread.
+        usleep(static_cast<useconds_t>(timeout_ms > 0 ? timeout_ms : 1) * 1000);
         return available_to_read() > 0;
     }
 
