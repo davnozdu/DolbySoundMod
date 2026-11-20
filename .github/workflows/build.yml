@@ -40,6 +40,7 @@ jobs:
           (cd aosp_hw_if && git sparse-checkout set \
             common/aidl/aidl_api/android.hardware.common/2 \
             common/fmq/aidl/aidl_api/android.hardware.common.fmq/1 \
+            audio/aidl/aidl_api/android.hardware.audio.common \
             audio/aidl/aidl_api/android.hardware.audio.effect/3)
 
           git clone --depth=1 --filter=blob:none --sparse https://android.googlesource.com/platform/system/hardware/interfaces aosp_sys_hw_if
@@ -48,6 +49,8 @@ jobs:
           mkdir -p aidl_src
           cp -r aosp_hw_if/common/aidl/aidl_api/android.hardware.common/2/* aidl_src/
           cp -r aosp_hw_if/common/fmq/aidl/aidl_api/android.hardware.common.fmq/1/* aidl_src/
+          LATEST_HW_AUDIO_COMMON=$(find aosp_hw_if/audio/aidl/aidl_api/android.hardware.audio.common -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n 1)
+          [ -n "$LATEST_HW_AUDIO_COMMON" ] && cp -r "$LATEST_HW_AUDIO_COMMON"/* aidl_src/
           cp -r aosp_hw_if/audio/aidl/aidl_api/android.hardware.audio.effect/3/* aidl_src/
           LATEST_AUDIO_COMMON=$(find aosp_sys_hw_if/media/aidl_api/android.media.audio.common.types -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n 1)
           if [ -z "$LATEST_AUDIO_COMMON" ]; then
@@ -56,6 +59,8 @@ jobs:
           fi
           echo "Using audio.common.types: $LATEST_AUDIO_COMMON"
           cp -r "$LATEST_AUDIO_COMMON"/* aidl_src/
+          LATEST_ERASER=$(find aosp_sys_hw_if/media/aidl_api/android.media.audio.eraser -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort -V | tail -n 1 || true)
+          [ -n "$LATEST_ERASER" ] && cp -r "$LATEST_ERASER"/* aidl_src/ || true
           find aidl_src -name "*.aidl" | head -n 30
 
       - name: Fetch ONNX Runtime Android (NNAPI) & StemgenRT model
