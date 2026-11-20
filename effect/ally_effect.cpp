@@ -28,23 +28,26 @@ using aidl::android::media::audio::common::AudioChannelLayout;
 using aidl::android::media::audio::common::AudioUuid;
 
 // AudioUuid holds a std::vector (not a literal type), so these are `const`,
-// not `constexpr`.
+// not `constexpr`. Every component is int32_t in the AIDL struct: casting the
+// clockSeq half-word to int16_t turns 0x8000 into -32768 while the framework
+// (and the HAL, which parses the config string) uses +32768, so the descriptor
+// never matched the configured UUID and the HAL dropped the effect.
 // Implementation UUID: a117500d-0001-4000-8000-000000000001
 const AudioUuid kImplUuid = {
-    static_cast<int32_t>(0xa117500d),
+    0xa117500d,
     0x0001,
     0x4000,
-    static_cast<int16_t>(0x8000),
+    0x8000,
     {0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
 };
 
 // Type UUID: LoudnessEnhancer (fe3199be-aed0-413f-87bb-11260eb63cf1)
 // Universally accepted by AudioFlinger on any MIXER session.
 const AudioUuid kTypeUuid = {
-    static_cast<int32_t>(0xfe3199be),
-    static_cast<int16_t>(0xaed0),
+    0xfe3199be,
+    0xaed0,
     0x413f,
-    static_cast<int16_t>(0x87bb),
+    0x87bb,
     {0x11, 0x26, 0x0e, 0xb6, 0x3c, 0xf1},
 };
 
