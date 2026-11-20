@@ -295,6 +295,14 @@ public class AllySoundCtl {
         Constructor<AudioEffect> ctor = AudioEffect.class.getDeclaredConstructor(
             UUID.class, UUID.class, int.class, int.class);
         ctor.setAccessible(true);
+        // Control experiment: /data/adb/allysound/stock_test makes the controller attach the
+        // vendor effect instead of ours. That tells us whether the status-queue handshake for a
+        // session effect works at all on this device, or whether it is our library that the
+        // client rejects.
+        if (new java.io.File(BASE_DIR + "/stock_test").exists()) {
+            UUID oplus = UUID.fromString("41f6c0f4-5d8f-11ec-bf63-0242ac130002");
+            return ctor.newInstance(oplus, oplus, 0, sessionId);
+        }
         return ctor.newInstance(TYPE_LOUDNESS, IMPL_ALLY, 0, sessionId);
     }
 
