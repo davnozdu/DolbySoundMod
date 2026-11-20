@@ -143,10 +143,18 @@ patch_sku_effects() {
         grep -q '<libraries>' "$SKU" || continue
         OUT="$DATA_DIR/sku_$(echo "$SKU" | tr '/' '_')"
         cp -f "$SKU" "$OUT" 2>/dev/null || continue
-        grep -q 'name="allysound"' "$OUT" && continue
-        awk '
+        grep -q 'name="allysound"' "$OUT" || awk '
         /<\/libraries>/ && !done {
             print "        <library name=\"allysound\" path=\"liballysoundaidl.so\"/>"
+            done=1
+        }
+        { print }
+        ' "$OUT" > "$OUT.new" && mv -f "$OUT.new" "$OUT"
+        # the HAL takes its UUID list from <effects> here, so the effect entry has
+        # to be present in this file as well, not only in audio_effects_config.xml
+        grep -q 'a117500d-0001-4000-8000-000000000001' "$OUT" || awk '
+        /<\/effects>/ && !done {
+            print "        <effect name=\"ally_sound\" library=\"allysound\" uuid=\"a117500d-0001-4000-8000-000000000001\" type=\"fe3199be-aed0-413f-87bb-11260eb63cf1\"/>"
             done=1
         }
         { print }
