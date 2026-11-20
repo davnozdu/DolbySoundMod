@@ -148,6 +148,8 @@ public:
     Profile profile() const { return profile_; }
     DeviceKind device() const { return device_; }
     bool neural() const { return neural_; }
+    bool reverb() const { return reverb_; }
+    bool npu_active() const { return vocals_.using_npu(); }
 
     // Process arbitrary number of interleaved float frames (2, 6, or 8 channels).
     // Output is always interleaved stereo float frames.

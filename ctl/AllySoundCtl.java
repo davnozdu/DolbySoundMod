@@ -22,6 +22,7 @@ public class AllySoundCtl {
     private static final String APPS_CONF = BASE_DIR + "/apps.conf";
     private static final String DEVICE_CONF = BASE_DIR + "/device.conf";
     private static final String NEURAL_CONF = BASE_DIR + "/neural.conf";
+    private static final String REVERB_CONF = BASE_DIR + "/reverb.conf";
     private static final String STATUS_JSON = BASE_DIR + "/status.json";
 
     private static class SessionEffect {
@@ -29,6 +30,7 @@ public class AllySoundCtl {
         String pkg;
         int profile;
         int neural;
+        int reverb;
         int device;
     }
 
@@ -95,6 +97,17 @@ public class AllySoundCtl {
 
     private static int readNeuralEnabled() {
         File f = new File(NEURAL_CONF);
+        if (!f.exists()) return 0;
+        try (BufferedReader br = new BufferedReader(new FileReader(f))) {
+            String line = br.readLine();
+            return (line != null && "1".equals(line.trim())) ? 1 : 0;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private static int readReverbEnabled() {
+        File f = new File(REVERB_CONF);
         if (!f.exists()) return 0;
         try (BufferedReader br = new BufferedReader(new FileReader(f))) {
             String line = br.readLine();
@@ -180,10 +193,10 @@ public class AllySoundCtl {
         return ctor.newInstance(TYPE_LOUDNESS, IMPL_ALLY, 0, sessionId);
     }
 
-    private static void setAllyParam(AudioEffect fx, int profile, int neural, int device) throws Exception {
+    private static void setAllyParam(AudioEffect fx, int profile, int neural, int reverb, int device) throws Exception {
         Method setParam = AudioEffect.class.getDeclaredMethod("setParameter", int.class, int.class);
         setParam.setAccessible(true);
-        int code = 10000 + profile * 100 + neural * 10 + device;
+        int code = 20000 + profile * 1000 + neural * 100 + reverb * 10 + device;
         setParam.invoke(fx, 0 /* PARAM_TARGET_GAIN_MB */, code);
     }
 
@@ -201,7 +214,9 @@ public class AllySoundCtl {
             SessionEffect se = e.getValue();
             sb.append("{\"id\":").append(e.getKey())
               .append(",\"pkg\":\"").append(se.pkg).append("\"")
-              .append(",\"profile\":\"").append(profileName(se.profile)).append("\"}");
+              .append(",\"profile\":\"").append(profileName(se.profile)).append("\"")
+              .append(",\"reverb\":").append(se.reverb != 0)
+              .append(",\"neural\":").append(se.neural != 0).append("}");
         }
         sb.append("]}");
         try (FileWriter fw = new FileWriter(STATUS_JSON)) {
@@ -231,6 +246,7 @@ public class AllySoundCtl {
                 String devMode = readDeviceMode();
                 int device = detectOutputDevice(devMode);
                 int neural = readNeuralEnabled();
+                int reverb = readReverbEnabled();
                 Map<Integer, String> sessions = readActiveSessions();
 
                 // Remove stale or disabled sessions
@@ -265,13 +281,14 @@ public class AllySoundCtl {
                         if (failed != null && System.currentTimeMillis() - failed < 15000) continue;
                         try {
                             AudioEffect fx = createAllyEffect(sid);
-                            setAllyParam(fx, prof, neural, device);
+                            setAllyParam(fx, prof, neural, reverb, device);
                             fx.setEnabled(true);
                             se = new SessionEffect();
                             se.effect = fx;
                             se.pkg = pkg;
                             se.profile = prof;
                             se.neural = neural;
+                            se.reverb = reverb;
                             se.device = device;
                             active.put(sid, se);
                             failedAt.remove(sid);
@@ -280,11 +297,13 @@ public class AllySoundCtl {
                             failedAt.put(sid, System.currentTimeMillis());
                             lastError = e.getClass().getSimpleName() + ": " + e.getMessage();
                         }
-                    } else if (se.profile != prof || se.neural != neural || se.device != device) {
+                    } else if (se.profile != prof || se.neural != neural || se.reverb != reverb ||
+                               se.device != device) {
                         try {
-                            setAllyParam(se.effect, prof, neural, device);
+                            setAllyParam(se.effect, prof, neural, reverb, device);
                             se.profile = prof;
                             se.neural = neural;
+                            se.reverb = reverb;
                             se.device = device;
                             lastError = null;
                         } catch (Exception e) {

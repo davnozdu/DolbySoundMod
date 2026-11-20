@@ -79,6 +79,15 @@ static bool is_known_uuid(const AudioUuid& u) {
     return u == kImplUuid || u == kOplusUuid;
 }
 
+// The vendor slot uuid (the one the Oplus policy config refers to). Our library is
+// installed there too, so the stock DSP library is not loaded at all, but the effect
+// itself deliberately declines that uuid: the policy attaches it to the global output
+// mix without ever opening it, and an unopened instance only floods the log with
+// 'invalid efGroup' for every buffer while processing nothing.
+static bool is_vendor_slot_uuid(const AudioUuid& u) {
+    return u == kOplusUuid;
+}
+
 Descriptor make_descriptor(const AudioUuid& impl) {
     Descriptor desc;
     // The Oplus slot reports itself exactly like the vendor library does: its own uuid is
@@ -126,6 +135,7 @@ public:
         renderer_.set_profile(profile_.load());
         renderer_.set_device(device_.load());
         renderer_.set_neural(neural_.load());
+        renderer_.set_reverb(reverb_.load());
 
         if (specific.has_value()) {
             apply_specific_locked(*specific);
@@ -249,6 +259,7 @@ private:
     std::atomic<ally::Profile> profile_{ally::Profile::Game};
     std::atomic<ally::DeviceKind> device_{ally::DeviceKind::Headphones};
     std::atomic<bool> neural_{false};
+    std::atomic<bool> reverb_{true};
     std::atomic<bool> worker_running_{false};
     std::thread worker_;
 
@@ -276,7 +287,31 @@ private:
                 return;
             }
             int32_t val = le.get<LoudnessEnhancer::Tag::gainMb>();
-            if (val >= 10000 && val < 11000) {
+            if (val >= 20000 && val < 30000) {
+                // profile * 1000 + neural * 100 + reverb * 10 + device
+                const int rem = val - 20000;
+                const int p = rem / 1000;
+                const int n = (rem / 100) % 10;
+                const int r = (rem / 10) % 10;
+                const int d = rem % 10;
+                if (p >= 0 && p <= 3) {
+                    auto prof = static_cast<ally::Profile>(p);
+                    profile_.store(prof);
+                    renderer_.set_profile(prof);
+                }
+                neural_.store(n != 0);
+                renderer_.set_neural(n != 0);
+                reverb_.store(r != 0);
+                renderer_.set_reverb(r != 0);
+                if (d >= 0 && d <= 2) {
+                    auto dev = static_cast<ally::DeviceKind>(d);
+                    device_.store(dev);
+                    renderer_.set_device(dev);
+                }
+                ALOGI("Updated params: profile=%d neural=%d reverb=%d device=%d", p, n, r, d);
+            } else if (val >= 10000 && val < 11000) {
+                // Older encoding without the reverb digit, kept so an app that still
+                // writes the four-digit code does not lose its settings.
                 int rem = val - 10000;
                 int p = rem / 100;
                 int n = (rem / 10) % 10;
@@ -395,11 +430,12 @@ private:
             stat_wait_us += std::chrono::duration_cast<std::chrono::microseconds>(t_proc0 - t_wait0).count();
             stat_proc_us += std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_proc0).count();
             if (std::chrono::duration_cast<std::chrono::milliseconds>(t_end - last_stat).count() >= 2000) {
-                ALOGI("effect stats: buffers=%llu timeouts=%llu avg_wait=%lluus avg_proc=%lluus state=%d",
+                ALOGI("effect stats: buffers=%llu timeouts=%llu avg_wait=%lluus avg_proc=%lluus "
+                      "state=%d reverb=%d npu=%d",
                       (unsigned long long)stat_buffers, (unsigned long long)stat_timeouts,
                       (unsigned long long)(stat_buffers ? stat_wait_us / stat_buffers : 0),
                       (unsigned long long)(stat_buffers ? stat_proc_us / stat_buffers : 0),
-                      (int)state_.load());
+                      (int)state_.load(), (int)reverb_.load(), (int)renderer_.npu_active());
                 stat_buffers = stat_timeouts = stat_wait_us = stat_proc_us = 0;
                 last_stat = t_end;
             }
@@ -428,6 +464,14 @@ extern "C" binder_status_t queryEffect(
     aidl::android::hardware::audio::effect::Descriptor* _aidl_return) {
     if (!in_impl_uuid || !_aidl_return) return STATUS_BAD_VALUE;
     if (!aidl::android::hardware::audio::effect::is_known_uuid(*in_impl_uuid)) return STATUS_NAME_NOT_FOUND;
+    if (aidl::android::hardware::audio::effect::is_vendor_slot_uuid(*in_impl_uuid)) {
+        // We are also installed in the vendor Oplus slot so the stock DSP library is
+        // gone, but the effect itself must only run through our own uuid: the vendor
+        // policy attaches that slot to the global output mix without ever opening it,
+        // so a live instance there would just log 'invalid efGroup' for every buffer.
+        ALOGI("declining vendor slot uuid: the effect runs under its own uuid");
+        return STATUS_NAME_NOT_FOUND;
+    }
     *_aidl_return = aidl::android::hardware::audio::effect::make_descriptor(*in_impl_uuid);
     return STATUS_OK;
 }
@@ -437,6 +481,14 @@ extern "C" binder_status_t createEffect(
     std::shared_ptr<aidl::android::hardware::audio::effect::IEffect>* _aidl_return) {
     if (!in_impl_uuid || !_aidl_return) return STATUS_BAD_VALUE;
     if (!aidl::android::hardware::audio::effect::is_known_uuid(*in_impl_uuid)) return STATUS_NAME_NOT_FOUND;
+    if (aidl::android::hardware::audio::effect::is_vendor_slot_uuid(*in_impl_uuid)) {
+        // We are also installed in the vendor Oplus slot so the stock DSP library is
+        // gone, but the effect itself must only run through our own uuid: the vendor
+        // policy attaches that slot to the global output mix without ever opening it,
+        // so a live instance there would just log 'invalid efGroup' for every buffer.
+        ALOGI("declining vendor slot uuid: the effect runs under its own uuid");
+        return STATUS_NAME_NOT_FOUND;
+    }
     auto inst = ndk::SharedRefBase::make<aidl::android::hardware::audio::effect::AllySoundEffect>(*in_impl_uuid);
     {
         std::lock_guard<std::mutex> lock(aidl::android::hardware::audio::effect::g_instances_mutex);
