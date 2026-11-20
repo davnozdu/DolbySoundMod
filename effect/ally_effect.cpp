@@ -7,11 +7,13 @@
 #include <aidl/android/media/audio/common/AudioChannelLayout.h>
 #include <aidl/android/media/audio/common/AudioUuid.h>
 #include <android/log.h>
+#include <dlfcn.h>
 
 #include <algorithm>
 #include <chrono>
 #include <atomic>
 #include <cstring>
+#include <unistd.h>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -77,6 +79,51 @@ const AudioUuid kOplusUuid = {
 
 static bool is_known_uuid(const AudioUuid& u) {
     return u == kImplUuid || u == kOplusUuid;
+}
+
+// EXPERIMENT (flag: /data/adb/allysound/borrow_status)
+//
+// The client in audioserver rejects the status queue this library creates: right after
+// open() it drops the effect with "handleSetConfig ... Failed". The vendor effect library
+// hands back the very same layout (quantum 12, four grantors, one fd) and is accepted, so
+// the difference has to be in the descriptor itself - the only thing that differs is the
+// backing object: the vendor hands out a /dev/ashmem character-device fd (st_size 0), we
+// hand out a memfd (st_size 4096). This makes open() return the vendor's status queue
+// verbatim to find out whether the descriptor is really what the client refuses.
+static std::shared_ptr<IEffect> g_stock_effect;
+static bool g_stock_load_tried = false;
+
+static bool borrow_vendor_status(const Parameter::Common& common,
+                                 IEffect::OpenEffectReturn* out) {
+    if (!g_stock_load_tried) {
+        g_stock_load_tried = true;
+        void* lib = dlopen("/odm/lib64/soundfx/libOplusAudioxAidl.so", RTLD_NOW);
+        if (lib == nullptr) {
+            ALOGE("borrow_status: dlopen failed: %s", dlerror());
+            return false;
+        }
+        using CreateFn = int (*)(const AudioUuid*, std::shared_ptr<IEffect>*);
+        auto create = reinterpret_cast<CreateFn>(dlsym(lib, "createEffect"));
+        if (create == nullptr) {
+            ALOGE("borrow_status: no createEffect in the vendor library");
+            return false;
+        }
+        AudioUuid uuid = kOplusUuid;
+        std::shared_ptr<IEffect> fx;
+        const int rc = create(&uuid, &fx);
+        if (rc != 0 || fx == nullptr) {
+            ALOGE("borrow_status: vendor createEffect rc=%d", rc);
+            return false;
+        }
+        g_stock_effect = fx;
+    }
+    if (g_stock_effect == nullptr) return false;
+    const auto st = g_stock_effect->open(common, std::nullopt, out);
+    if (!st.isOk()) {
+        ALOGE("borrow_status: vendor open failed");
+        return false;
+    }
+    return true;
 }
 
 Descriptor make_descriptor(const AudioUuid& impl) {
@@ -150,6 +197,14 @@ public:
         _aidl_return->statusMQ = status_mq_.dup_descriptor();
         _aidl_return->inputDataMQ = in_mq_.dup_descriptor();
         _aidl_return->outputDataMQ = out_mq_.dup_descriptor();
+
+        if (access("/data/adb/allysound/borrow_status", F_OK) == 0) {
+            IEffect::OpenEffectReturn vendor{};
+            if (borrow_vendor_status(common, &vendor)) {
+                _aidl_return->statusMQ = vendor.statusMQ;
+                ALOGI("borrow_status: returning the vendor status queue to the client");
+            }
+        }
 
         state_.store(State::IDLE);
         start_worker_locked();
