@@ -3,6 +3,7 @@
 #include <aidl/android/hardware/common/fmq/MQDescriptor.h>
 #include <aidl/android/hardware/common/fmq/SynchronizedReadWrite.h>
 #include <android/binder_ibinder.h>
+#include <fcntl.h>
 #include <linux/futex.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -86,7 +87,7 @@ public:
         desc.grantors[1] = {0, 8, 8};
         desc.grantors[2] = {0, 16, static_cast<int64_t>(data_bytes_)};
         size_t aligned_data = (data_bytes_ + 7) & ~size_t(7);
-        desc.grantors[3] = {0, static_cast<int64_t>(16 + aligned_data), 4};
+        desc.grantors[3] = {0, static_cast<int32_t>(16 + aligned_data), 4};
 
         int dup_fd = fcntl(fd_, F_DUPFD_CLOEXEC, 0);
         desc.handle.fds.emplace_back(ndk::ScopedFileDescriptor(dup_fd));

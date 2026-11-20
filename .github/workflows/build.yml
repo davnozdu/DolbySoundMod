@@ -26,45 +26,81 @@ jobs:
 
       - name: Locate Android NDK & Build-Tools
         run: |
+          set -euo pipefail
           NDK_DIR=$(ls -d "$ANDROID_HOME/ndk/"* | sort -V | tail -n 1)
           BT_DIR=$(ls -d "$ANDROID_HOME/build-tools/"* | sort -V | tail -n 1)
-          PLAT_JAR=$(ls "$ANDROID_HOME/platforms/android-"*"/android.jar" | sort -V | tail -n 1)
+          # Prefer a numbered platform (android-35/android-36); codename preview
+          # platforms would be picked up by version sort otherwise.
+          PLAT_JAR=$(ls -d "$ANDROID_HOME/platforms/android-"*/android.jar 2>/dev/null \
+            | grep -E '/android-[0-9]+(\.[0-9]+)?/android\.jar$' | sort -V | tail -n 1)
+          [ -n "$PLAT_JAR" ] || PLAT_JAR=$(ls -d "$ANDROID_HOME/platforms/android-"*/android.jar | sort -V | tail -n 1)
+          [ -x "$BT_DIR/aidl" ] || { echo "no aidl in $BT_DIR"; exit 1; }
+          [ -f "$PLAT_JAR" ] || { echo "no android.jar found"; exit 1; }
           echo "NDK_DIR=$NDK_DIR" >> "$GITHUB_ENV"
           echo "BT_DIR=$BT_DIR" >> "$GITHUB_ENV"
           echo "PLAT_JAR=$PLAT_JAR" >> "$GITHUB_ENV"
-          echo "NDK=$NDK_DIR BT=$BT_DIR JAR=$PLAT_JAR"
+          echo "NDK=$NDK_DIR"
+          echo "BT=$BT_DIR"
+          echo "JAR=$PLAT_JAR"
+          "$BT_DIR/aidl" --help 2>&1 | grep -m1 'built for platform' || true
 
+      # android.hardware.audio.effect pulls types from five other VINTF modules.
+      # Every one of them must be in aidl_src/ or the compiler stops with
+      # "Couldn't find import for class ...". A missing path fails here loudly
+      # instead of being skipped silently by a `|| true`.
       - name: Fetch AOSP AIDL definitions
         run: |
-          git clone --depth=1 --filter=blob:none --sparse https://android.googlesource.com/platform/hardware/interfaces aosp_hw_if
+          set -euo pipefail
+          git clone --depth=1 --filter=blob:none --sparse \
+            https://android.googlesource.com/platform/hardware/interfaces aosp_hw_if
           (cd aosp_hw_if && git sparse-checkout set \
-            common/aidl/aidl_api/android.hardware.common/2 \
-            common/fmq/aidl/aidl_api/android.hardware.common.fmq/1 \
-            audio/aidl/aidl_api/android.hardware.audio.common \
-            audio/aidl/aidl_api/android.hardware.audio.effect/3)
+            common/aidl/aidl_api \
+            common/fmq/aidl/aidl_api \
+            audio/aidl/aidl_api)
 
-          git clone --depth=1 --filter=blob:none --sparse https://android.googlesource.com/platform/system/hardware/interfaces aosp_sys_hw_if
+          git clone --depth=1 --filter=blob:none --sparse \
+            https://android.googlesource.com/platform/system/hardware/interfaces aosp_sys_hw_if
           (cd aosp_sys_hw_if && git sparse-checkout set media/aidl_api)
 
           mkdir -p aidl_src
-          cp -r aosp_hw_if/common/aidl/aidl_api/android.hardware.common/2/* aidl_src/
-          cp -r aosp_hw_if/common/fmq/aidl/aidl_api/android.hardware.common.fmq/1/* aidl_src/
-          LATEST_HW_AUDIO_COMMON=$(find aosp_hw_if/audio/aidl/aidl_api/android.hardware.audio.common -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n 1)
-          [ -n "$LATEST_HW_AUDIO_COMMON" ] && cp -r "$LATEST_HW_AUDIO_COMMON"/* aidl_src/
-          cp -r aosp_hw_if/audio/aidl/aidl_api/android.hardware.audio.effect/3/* aidl_src/
-          LATEST_AUDIO_COMMON=$(find aosp_sys_hw_if/media/aidl_api/android.media.audio.common.types -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n 1)
-          if [ -z "$LATEST_AUDIO_COMMON" ]; then
-            echo "ERROR: android.media.audio.common.types not found"
-            exit 1
-          fi
-          echo "Using audio.common.types: $LATEST_AUDIO_COMMON"
-          cp -r "$LATEST_AUDIO_COMMON"/* aidl_src/
-          LATEST_ERASER=$(find aosp_sys_hw_if/media/aidl_api/android.media.audio.eraser -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort -V | tail -n 1 || true)
-          [ -n "$LATEST_ERASER" ] && cp -r "$LATEST_ERASER"/* aidl_src/ || true
-          find aidl_src -name "*.aidl" | head -n 30
+          copy_pkg() { # $1 = dir holding android/**/*.aidl, $2 = label
+            if [ ! -d "$1" ] || [ -z "$(find "$1" -name '*.aidl' -print -quit)" ]; then
+              echo "ERROR: AIDL package $2 not found at $1" >&2
+              exit 1
+            fi
+            cp -r "$1"/. aidl_src/
+            echo "  + $2 ($(find "$1" -name '*.aidl' | wc -l) aidl files)"
+          }
+
+          copy_pkg aosp_hw_if/common/aidl/aidl_api/android.hardware.common/2               android.hardware.common@2
+          copy_pkg aosp_hw_if/common/fmq/aidl/aidl_api/android.hardware.common.fmq/1       android.hardware.common.fmq@1
+          copy_pkg aosp_hw_if/audio/aidl/aidl_api/android.hardware.audio.common/current    android.hardware.audio.common@current
+          copy_pkg aosp_hw_if/audio/aidl/aidl_api/android.hardware.audio.effect/current    android.hardware.audio.effect@current
+          copy_pkg aosp_sys_hw_if/media/aidl_api/android.media.audio.common.types/current  android.media.audio.common.types@current
+          copy_pkg aosp_sys_hw_if/media/aidl_api/android.media.audio.eraser.types/current  android.media.audio.eraser.types@current
+
+          echo "total AIDL files: $(find aidl_src -name '*.aidl' | wc -l)"
+
+      # The C++ binder headers are NOT part of the NDK (it ships only the C API),
+      # but every AIDL-generated header includes <android/binder_interface_utils.h>.
+      # AOSP builds vendor AIDL modules from these platform headers.
+      - name: Fetch libbinder_ndk C++ headers
+        run: |
+          set -euo pipefail
+          git clone --depth=1 --filter=blob:none --sparse \
+            https://android.googlesource.com/platform/frameworks/native aosp_frameworks_native
+          (cd aosp_frameworks_native && git sparse-checkout set libs/binder/ndk)
+          BINDER_INC="$PWD/aosp_frameworks_native/libs/binder/ndk"
+          for h in include_cpp/android/binder_interface_utils.h include_cpp/android/binder_auto_utils.h \
+                   include_ndk/android/binder_ibinder.h; do
+            [ -f "$BINDER_INC/$h" ] || { echo "ERROR: missing binder header $h"; exit 1; }
+          done
+          echo "BINDER_INC=$BINDER_INC" >> "$GITHUB_ENV"
+          ls "$BINDER_INC/include_cpp/android" "$BINDER_INC/include_ndk/android"
 
       - name: Fetch ONNX Runtime Android (NNAPI) & StemgenRT model
         run: |
+          set -euo pipefail
           mkdir -p onnxruntime models
           curl -fsSL -o onnxruntime/ort.aar \
             "https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/1.20.0/onnxruntime-android-1.20.0.aar"
@@ -74,64 +110,74 @@ jobs:
             "https://media.githubusercontent.com/media/sweetspotsoundsystem/stemgen-rt/main/model/parallel/vocals.onnx"
           echo "f29a3d8fa596ce4672dd4dc77ccf224f2538389940264aad46ab8168311c2148  models/vocals.onnx" | sha256sum -c -
 
+      # --min_sdk_version=35 is mandatory: VendorExtension.aidl uses
+      # ParcelableHolder, which the NDK backend rejects below SDK 31 and refuses
+      # at its 29 default.
       - name: Compile AIDL to NDK C++
         run: |
+          set -euo pipefail
           mkdir -p aidl_gen/include aidl_gen/src
-          AIDL_BIN="$BT_DIR/aidl"
-          "$AIDL_BIN" --lang=ndk --structured --stability=vintf -I aidl_src -h aidl_gen/include -o aidl_gen/src $(find aidl_src -name "*.aidl")
+          "$BT_DIR/aidl" --lang=ndk --structured --stability=vintf --min_sdk_version=35 \
+            --omit_invocation \
+            -I aidl_src -h aidl_gen/include -o aidl_gen/src \
+            $(find aidl_src -name '*.aidl')
+          echo "generated sources: $(find aidl_gen/src -name '*.cpp' | wc -l)"
+          [ -f aidl_gen/include/aidl/android/hardware/audio/effect/BnEffect.h ] \
+            || { echo "ERROR: BnEffect.h was not generated"; exit 1; }
 
-      - name: Build AIDL stub libs and liballysoundaidl.so (arm64-v8a)
+      # One self-contained library: every generated AIDL translation unit goes into
+      # liballysoundaidl.so. libc++ is linked statically (the NDK has no libc++.so
+      # stub, and the platform .so exports std::__1 while NDK headers emit
+      # std::__ndk1), so the only DT_NEEDED entries are system libraries.
+      - name: Build liballysoundaidl.so (arm64-v8a)
         run: |
-          CC_BIN="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang++"
-          mkdir -p build_arm64 stubs
-          CXXFLAGS="-std=c++17 -O3 -fPIC -fvisibility=default -D__ANDROID_API__=35 -D_LIBCPP_ABI_NAMESPACE=__1 -DALLY_ENABLE_NPU -Iaidl_gen/include -Idsp -Ieffect -Ionnxruntime/headers"
+          set -euo pipefail
+          NDK_BIN="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CXX="$NDK_BIN/aarch64-linux-android35-clang++"
+          export FLAGS="-std=c++17 -O2 -fPIC -fvisibility=default -fvisibility-inlines-hidden -DALLY_ENABLE_NPU -Iaidl_gen/include -Idsp -Ieffect -Ionnxruntime/headers -I$BINDER_INC/include_cpp -I$BINDER_INC/include_ndk"
+          mkdir -p build_arm64
+          rm -f build_arm64/*.o
 
-          echo "" | "$CC_BIN" -x c -c - -o build_arm64/empty.o
-          "$CC_BIN" -shared -nostdlib++ -Wl,-soname,libc++.so build_arm64/empty.o -o stubs/libc++.so
+          cat > compile_one.sh <<'EOS'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          obj="build_arm64/aidl_$(echo "$1" | tr '/' '_').o"
+          "$CXX" $FLAGS -c "$1" -o "$obj"
+          EOS
+          chmod +x compile_one.sh
 
-          compile_group() {
-            local soname="$1"
-            local pattern="$2"
-            shift 2
-            local objs=()
-            for f in $(find aidl_gen/src -path "$pattern" -name "*.cpp"); do
-              local obj="build_arm64/$(echo "$f" | tr '/' '_').o"
-              "$CC_BIN" $CXXFLAGS -c "$f" -o "$obj"
-              objs+=("$obj")
-            done
-            "$CC_BIN" -shared -nostdlib++ -Wl,--allow-shlib-undefined -Wl,-soname,"$soname" "${objs[@]}" "$@" stubs/libc++.so -lbinder_ndk -llog -o "stubs/$soname"
-          }
+          find aidl_gen/src -name '*.cpp' | sort | xargs -P "$(nproc)" -n 1 ./compile_one.sh
+          mapfile -t objs < <(find build_arm64 -name 'aidl_*.o' | sort)
+          echo "compiled ${#objs[@]} AIDL translation units"
 
-          compile_group "android.hardware.common-V2-ndk.so" "*/android/hardware/common/[!f]*.cpp"
-          compile_group "android.hardware.common.fmq-V1-ndk.so" "*/android/hardware/common/fmq/*.cpp" "stubs/android.hardware.common-V2-ndk.so"
-          compile_group "android.media.audio.common.types-V5-ndk.so" "*/android/media/audio/common/*.cpp" "stubs/android.hardware.common-V2-ndk.so"
-          compile_group "android.hardware.audio.effect-V3-ndk.so" "*/android/hardware/audio/effect/*.cpp" \
-            "stubs/android.media.audio.common.types-V5-ndk.so" \
-            "stubs/android.hardware.common.fmq-V1-ndk.so" \
-            "stubs/android.hardware.common-V2-ndk.so"
-
-          "$CC_BIN" $CXXFLAGS -shared -nostdlib++ -Wl,--allow-shlib-undefined \
-            dsp/spatial.cpp dsp/vocals.cpp effect/ally_effect.cpp \
-            stubs/android.hardware.audio.effect-V3-ndk.so \
-            stubs/android.media.audio.common.types-V5-ndk.so \
-            stubs/android.hardware.common.fmq-V1-ndk.so \
-            stubs/android.hardware.common-V2-ndk.so \
-            stubs/libc++.so \
+          "$CXX" $FLAGS -shared -static-libstdc++ -Wl,--exclude-libs,ALL -Wl,-soname,liballysoundaidl.so \
+            "${objs[@]}" dsp/spatial.cpp dsp/vocals.cpp effect/ally_effect.cpp \
             -lbinder_ndk -llog -lm -ldl \
             -o build_arm64/liballysoundaidl.so
 
+          echo "--- DT_NEEDED"
+          "$NDK_BIN/llvm-readelf" -d build_arm64/liballysoundaidl.so | grep NEEDED
+          echo "--- exported entry points"
+          "$NDK_BIN/llvm-nm" -D --defined-only build_arm64/liballysoundaidl.so \
+            | grep -E ' (queryEffect|createEffect|destroyEffect)$'
+          ls -l build_arm64/liballysoundaidl.so
+
       - name: Compile AllySoundCtl.dex
         run: |
+          set -euo pipefail
           mkdir -p build_java
           javac -source 11 -target 11 -cp "$PLAT_JAR" -d build_java ctl/AllySoundCtl.java
           "$BT_DIR/d8" --min-api 31 --output build_java build_java/*.class
+          ls -l build_java
 
       - name: Package KernelSU Module ZIP
         run: |
+          set -euo pipefail
           VER_CODE=$((100 + GITHUB_RUN_NUMBER))
           VER_STR="v1.0.${GITHUB_RUN_NUMBER}"
+          rm -rf dist DolbySoundMod.zip
           mkdir -p dist/module/vendor/lib64/soundfx dist/module/vendor/etc/allysound dist/module/bin
-          cp -r module/* dist/module/
+          cp -r module/. dist/module/
           sed -i "s/^version=.*/version=${VER_STR}/" dist/module/module.prop
           sed -i "s/^versionCode=.*/versionCode=${VER_CODE}/" dist/module/module.prop
           cp build_arm64/liballysoundaidl.so dist/module/vendor/lib64/soundfx/liballysoundaidl.so
@@ -141,6 +187,7 @@ jobs:
           chmod 0755 dist/module/post-fs-data.sh dist/module/service.sh dist/module/uninstall.sh dist/module/bin/check_update.sh
           chmod 0644 dist/module/vendor/lib64/soundfx/liballysoundaidl.so dist/module/vendor/lib64/libonnxruntime.so dist/module/vendor/etc/allysound/vocals.onnx dist/module/bin/AllySoundCtl.dex
           (cd dist/module && zip -r9 ../../DolbySoundMod.zip .)
+          unzip -l DolbySoundMod.zip | tail -n 15
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
@@ -157,9 +204,10 @@ jobs:
 
       - name: Update update.json on main
         run: |
+          set -euo pipefail
           VER_CODE=$((100 + GITHUB_RUN_NUMBER))
           VER_STR="v1.0.${GITHUB_RUN_NUMBER}"
-          cat <<EOF > update.json
+          cat > update.json <<EOF
           {
             "version": "${VER_STR}",
             "versionCode": ${VER_CODE},

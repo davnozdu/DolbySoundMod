@@ -27,8 +27,10 @@ namespace {
 using aidl::android::media::audio::common::AudioChannelLayout;
 using aidl::android::media::audio::common::AudioUuid;
 
+// AudioUuid holds a std::vector (not a literal type), so these are `const`,
+// not `constexpr`.
 // Implementation UUID: a117500d-0001-4000-8000-000000000001
-constexpr AudioUuid kImplUuid = {
+const AudioUuid kImplUuid = {
     static_cast<int32_t>(0xa117500d),
     0x0001,
     0x4000,
@@ -38,7 +40,7 @@ constexpr AudioUuid kImplUuid = {
 
 // Type UUID: LoudnessEnhancer (fe3199be-aed0-413f-87bb-11260eb63cf1)
 // Universally accepted by AudioFlinger on any MIXER session.
-constexpr AudioUuid kTypeUuid = {
+const AudioUuid kTypeUuid = {
     static_cast<int32_t>(0xfe3199be),
     static_cast<int16_t>(0xaed0),
     0x413f,
@@ -181,8 +183,10 @@ public:
             return ndk::ScopedAStatus::ok();
         }
         if (paramId.getTag() == Parameter::Id::loudnessEnhancerTag) {
+            // LoudnessEnhancer is an AIDL *union* (vendor | gainMb), not a
+            // parcelable with a plain field: the value goes in through set<>().
             LoudnessEnhancer le;
-            le.gainMb = encoded_gain_mb();
+            le.set<LoudnessEnhancer::Tag::gainMb>(encoded_gain_mb());
             Parameter::Specific spec;
             spec.set<Parameter::Specific::loudnessEnhancer>(le);
             _aidl_return->set<Parameter::specific>(spec);
@@ -230,7 +234,11 @@ private:
 
     void apply_specific_locked(const Parameter::Specific& spec) {
         if (spec.getTag() == Parameter::Specific::loudnessEnhancer) {
-            int32_t val = spec.get<Parameter::Specific::loudnessEnhancer>().gainMb;
+            const auto& le = spec.get<Parameter::Specific::loudnessEnhancer>();
+            if (le.getTag() != LoudnessEnhancer::Tag::gainMb) {
+                return;
+            }
+            int32_t val = le.get<LoudnessEnhancer::Tag::gainMb>();
             if (val >= 10000 && val < 11000) {
                 int rem = val - 10000;
                 int p = rem / 100;

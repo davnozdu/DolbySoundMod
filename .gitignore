@@ -7,3 +7,10 @@ aidl_gen/
 stubs/
 dist/
 *.zip
+*.o
+onnxruntime/
+models/
+aosp_hw_if/
+aosp_sys_hw_if/
+aosp_frameworks_native/
+compile_one.sh

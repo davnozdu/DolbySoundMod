@@ -14,6 +14,7 @@
 ## Сборка
 Сборка выполняется автоматически в GitHub Actions (`.github/workflows/build.yml`):
 1. Генерация `dsp/hrir_ku100.hpp` из `SADIE_KU100_DFC_256_order_fir_48000.sofa`.
-2. Компиляция AIDL-интерфейсов (`android.hardware.audio.effect` V3, `android.media.audio.common.types` V5) и сборка `liballysoundaidl.so` (`arm64-v8a`) под Android NDK.
-3. Компиляция `AllySoundCtl.dex`.
-4. Упаковка в готовый `AllySoundKSU.zip` для установки в KernelSU.
+2. Клонирование AIDL-определений из AOSP (`android.hardware.audio.effect`, `android.hardware.audio.common`, `android.hardware.common`, `android.hardware.common.fmq`, `android.media.audio.common.types`, `android.media.audio.eraser.types`) и C++-заголовков `libbinder_ndk` (в NDK их нет).
+3. Компиляция AIDL в NDK C++ (`--lang=ndk --stability=vintf --min_sdk_version=35`) и сборка одного самодостаточного `liballysoundaidl.so` (`arm64-v8a`): все сгенерированные единицы трансляции + DSP + эффект, libc++ статически, из внешних зависимостей — только системные `libbinder_ndk`, `liblog`, `libm`, `libdl`, `libc`.
+4. Компиляция `AllySoundCtl.dex`.
+5. Упаковка в готовый `DolbySoundMod.zip` для установки в KernelSU.
