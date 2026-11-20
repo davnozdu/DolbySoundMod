@@ -3,10 +3,14 @@
 #include <aidl/android/hardware/common/fmq/MQDescriptor.h>
 #include <aidl/android/hardware/common/fmq/SynchronizedReadWrite.h>
 #include <android/binder_ibinder.h>
+#include <android/sharedmem.h>
 #include <android/log.h>
 
 #ifndef ALOGE
 #define ALOGE(...) __android_log_print(ANDROID_LOG_ERROR, "AllySoundAidl", __VA_ARGS__)
+#endif
+#ifndef ALOGW
+#define ALOGW(...) __android_log_print(ANDROID_LOG_WARN, "AllySoundAidl", __VA_ARGS__)
 #endif
 #include <fcntl.h>
 #include <linux/futex.h>
@@ -38,6 +42,29 @@ public:
     FmqQueue(const FmqQueue&) = delete;
     FmqQueue& operator=(const FmqQueue&) = delete;
 
+    // A vendor HAL domain may refuse ftruncate on a memfd while still allowing other
+    // ways to give it a size, so try the alternatives before giving up.
+    static bool size_file(int fd, size_t bytes) {
+        if (ftruncate(fd, static_cast<off_t>(bytes)) == 0) return true;
+        ALOGW("fmq: ftruncate errno=%d, trying fallocate", errno);
+        if (fallocate(fd, 0, 0, static_cast<off_t>(bytes)) == 0) return true;
+        ALOGW("fmq: fallocate errno=%d, trying pwrite", errno);
+        static const size_t kChunk = 65536;
+        std::vector<uint8_t> zeros(std::min(bytes, kChunk), 0);
+        size_t done = 0;
+        while (done < bytes) {
+            size_t n = std::min(zeros.size(), bytes - done);
+            ssize_t w = pwrite(fd, zeros.data(), n, static_cast<off_t>(done));
+            if (w <= 0) {
+                ALOGE("fmq: pwrite errno=%d at %zu/%zu", errno, done, bytes);
+                return false;
+            }
+            done += static_cast<size_t>(w);
+        }
+        ALOGW("fmq: sized memfd with pwrite (%zu bytes)", bytes);
+        return true;
+    }
+
     bool init(size_t count) {
         reset();
         count_ = count;
@@ -46,13 +73,24 @@ public:
         total_bytes_ = 16 + aligned_data + 4; // readPtr(8) + writePtr(8) + data + eventFlag(4)
 
         errno = 0;
-        fd_ = static_cast<int>(syscall(__NR_memfd_create, "ally_fmq", 1 /* MFD_CLOEXEC */));
-        if (fd_ < 0) {
-            ALOGE("fmq: memfd_create failed: %s (count=%zu bytes=%zu)", strerror(errno), count_, total_bytes_);
-            return false;
+        // Prefer the platform allocator: it is the same path libfmq uses for the stock
+        // effect libraries in this very process, so whatever the HAL domain allows for
+        // them it allows here (a bare memfd + ftruncate hits EACCES in that domain).
+        bool sized = false;
+        fd_ = ASharedMemory_create("ally_fmq", total_bytes_);
+        if (fd_ >= 0) {
+            sized = true;
+        } else {
+            ALOGW("fmq: ASharedMemory_create failed: %s, falling back to memfd",
+                  strerror(errno));
+            fd_ = static_cast<int>(syscall(__NR_memfd_create, "ally_fmq", 1 /* MFD_CLOEXEC */));
+            if (fd_ < 0) {
+                ALOGE("fmq: memfd_create failed: %s (count=%zu bytes=%zu)", strerror(errno),
+                      count_, total_bytes_);
+                return false;
+            }
         }
-        if (ftruncate(fd_, static_cast<off_t>(total_bytes_)) != 0) {
-            ALOGE("fmq: ftruncate failed: %s (bytes=%zu)", strerror(errno), total_bytes_);
+        if (!sized && !size_file(fd_, total_bytes_)) {
             reset();
             return false;
         }

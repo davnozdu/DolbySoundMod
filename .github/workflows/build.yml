@@ -152,14 +152,14 @@ jobs:
 
           "$CXX" $FLAGS -shared -static-libstdc++ -Wl,--exclude-libs,ALL -Wl,-soname,liballysoundaidl.so \
             "${objs[@]}" dsp/spatial.cpp dsp/vocals.cpp effect/ally_effect.cpp \
-            -lbinder_ndk -llog -lm -ldl \
+            -lbinder_ndk -landroid -llog -lm -ldl \
             -o build_arm64/liballysoundaidl.so
 
           # Same code, second identity: the vendor HAL loads this file by name, so its
           # soname must match the file that ends up in /odm/lib64/soundfx.
           "$CXX" $FLAGS -shared -static-libstdc++ -Wl,--exclude-libs,ALL -Wl,-soname,libOplusAudioxAidl.so \
             "${objs[@]}" dsp/spatial.cpp dsp/vocals.cpp effect/ally_effect.cpp \
-            -lbinder_ndk -llog -lm -ldl \
+            -lbinder_ndk -landroid -llog -lm -ldl \
             -o build_arm64/libOplusAudioxAidl.so
 
           echo "--- DT_NEEDED"
