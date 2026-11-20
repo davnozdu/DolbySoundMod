@@ -14,6 +14,39 @@ while [ "$(getprop sys.boot_completed)" != "1" ]; do
     sleep 2
 done
 
+# Other modules (AutoSystemBoost mounts its own patched file over
+# /odm/etc/audio_effects_config.xml) may override the config after our
+# post-fs-data ran, which drops the allysound library/effect. Re-assert it once
+# everything has settled and restart audioserver only if we had to.
+UUID_RE="a117500d-0001-4000-8000-000000000001"
+LIVE=/odm/etc/audio_effects_config.xml
+[ -f "$LIVE" ] || LIVE=/vendor/etc/audio_effects_config.xml
+if [ -f "$LIVE" ] && ! grep -q "$UUID_RE" "$LIVE" 2>/dev/null; then
+    OUT="$DATA_DIR/live_config.xml"
+    if cp -f "$LIVE" "$OUT"; then
+        awk '
+        /<\/libraries>/ && !lib_done {
+            print "        <library name=\"allysound\" path=\"liballysoundaidl.so\"/>"
+            lib_done=1
+        }
+        /<\/effects>/ && !eff_done {
+            print "        <effect name=\"ally_sound\" library=\"allysound\" uuid=\"a117500d-0001-4000-8000-000000000001\" type=\"fe3199be-aed0-413f-87bb-11260eb63cf1\"/>"
+            eff_done=1
+        }
+        { print }
+        ' "$OUT" > "$OUT.new" && mv -f "$OUT.new" "$OUT"
+        chmod 0644 "$OUT"
+        chcon u:object_r:vendor_configs_file:s0 "$OUT" 2>/dev/null
+        if mount --bind "$OUT" "$LIVE"; then
+            echo "config re-asserted: $LIVE" >> "$DATA_DIR/mount.log"
+            setprop ctl.restart audioserver 2>/dev/null
+            sleep 3
+        else
+            echo "config re-assert FAILED: $LIVE" >> "$DATA_DIR/mount.log"
+        fi
+    fi
+fi
+
 # Background auto-update check (runs once 30s after boot if enabled)
 (
     sleep 30
