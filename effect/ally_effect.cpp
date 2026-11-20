@@ -132,8 +132,16 @@ public:
 
         const size_t in_samples = std::max<size_t>(frame_count_ * in_channels_ * 4, 4096);
         const size_t out_samples = std::max<size_t>(frame_count_ * out_channels_ * 4, 4096);
-        if (!status_mq_.init(128) || !in_mq_.init(in_samples) || !out_mq_.init(out_samples)) {
-            ALOGE("Failed to initialize FMQ queues");
+        if (!status_mq_.init(128)) {
+            ALOGE("Failed to initialize FMQ: status queue");
+            return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_STATE);
+        }
+        if (!in_mq_.init(in_samples)) {
+            ALOGE("Failed to initialize FMQ: input queue (%zu)", in_samples);
+            return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_STATE);
+        }
+        if (!out_mq_.init(out_samples)) {
+            ALOGE("Failed to initialize FMQ: output queue (%zu)", out_samples);
             return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_STATE);
         }
 

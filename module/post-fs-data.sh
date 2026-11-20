@@ -78,6 +78,9 @@ stage_soundfx() {
     fi
     rm -rf "$STAGE"
     mkdir -p "$STAGE" || return 1
+    # the mount root inherits this directory's label: leave it adb_data_file and the
+    # audio HAL is denied access to everything below it
+    chcon u:object_r:vendor_file:s0 "$STAGE" 2>/dev/null
 
     count_src=0
     for f in "$SFX_DIR"/*; do
@@ -187,6 +190,7 @@ stage_odm_soundfx() {
     OSTAGE="$DATA_DIR/odmsfx_stage"
     rm -rf "$OSTAGE"
     mkdir -p "$OSTAGE" || return 1
+    chcon u:object_r:vendor_file:s0 "$OSTAGE" 2>/dev/null
     ocount=0
     for f in "$SRC"/*; do
         [ -f "$f" ] || continue

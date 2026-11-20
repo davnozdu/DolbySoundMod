@@ -3,13 +3,19 @@
 #include <aidl/android/hardware/common/fmq/MQDescriptor.h>
 #include <aidl/android/hardware/common/fmq/SynchronizedReadWrite.h>
 #include <android/binder_ibinder.h>
+#include <android/log.h>
+
+#ifndef ALOGE
+#define ALOGE(...) __android_log_print(ANDROID_LOG_ERROR, "AllySoundAidl", __VA_ARGS__)
+#endif
 #include <fcntl.h>
 #include <linux/futex.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
-#include <atomic>
+#include <cerrno>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
@@ -39,15 +45,21 @@ public:
         size_t aligned_data = (data_bytes_ + 7) & ~size_t(7);
         total_bytes_ = 16 + aligned_data + 4; // readPtr(8) + writePtr(8) + data + eventFlag(4)
 
+        errno = 0;
         fd_ = static_cast<int>(syscall(__NR_memfd_create, "ally_fmq", 1 /* MFD_CLOEXEC */));
-        if (fd_ < 0) return false;
+        if (fd_ < 0) {
+            ALOGE("fmq: memfd_create failed: %s (count=%zu bytes=%zu)", strerror(errno), count_, total_bytes_);
+            return false;
+        }
         if (ftruncate(fd_, static_cast<off_t>(total_bytes_)) != 0) {
+            ALOGE("fmq: ftruncate failed: %s (bytes=%zu)", strerror(errno), total_bytes_);
             reset();
             return false;
         }
         base_ = static_cast<uint8_t*>(
             mmap(nullptr, total_bytes_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0));
         if (base_ == MAP_FAILED) {
+            ALOGE("fmq: mmap failed: %s (bytes=%zu)", strerror(errno), total_bytes_);
             base_ = nullptr;
             reset();
             return false;
