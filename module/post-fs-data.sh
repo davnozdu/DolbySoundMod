@@ -192,6 +192,14 @@ stage_odm_soundfx() {
         log "oplus slot skipped: disable_oplus flag present"
         return 0
     fi
+    # Off by default. The vendor policy attaches whatever lives in this slot to the global
+    # output chain and never opens it, so our instance sat there failing every buffer with
+    # "invalid efGroup" - audible as dropouts - while never producing sound. Only stage it
+    # when the user explicitly asks for the experiment with the enable_oplus flag.
+    if [ ! -f "$DATA_DIR/enable_oplus" ]; then
+        log "oplus slot skipped: opt-in experiment (create $DATA_DIR/enable_oplus to try it)"
+        return 0
+    fi
     OURS="$MODDIR/vendor/lib64/soundfx/libOplusAudioxAidl.so"
     [ -f "$OURS" ] || { log "no $OURS"; return 0; }
     OSTAGE="$DATA_DIR/odmsfx_stage"
