@@ -73,7 +73,7 @@ jobs:
         run: |
           mkdir -p aidl_gen/include aidl_gen/src
           AIDL_BIN="$BT_DIR/aidl"
-          "$AIDL_BIN" --lang=ndk --structured -I aidl_src -h aidl_gen/include -o aidl_gen/src $(find aidl_src -name "*.aidl")
+          "$AIDL_BIN" --lang=ndk --structured --stability=vintf -I aidl_src -h aidl_gen/include -o aidl_gen/src $(find aidl_src -name "*.aidl")
 
       - name: Build AIDL stub libs and liballysoundaidl.so (arm64-v8a)
         run: |
