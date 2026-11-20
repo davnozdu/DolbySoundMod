@@ -155,10 +155,17 @@ jobs:
             -lbinder_ndk -llog -lm -ldl \
             -o build_arm64/liballysoundaidl.so
 
+          # Same code, second identity: the vendor HAL loads this file by name, so its
+          # soname must match the file that ends up in /odm/lib64/soundfx.
+          "$CXX" $FLAGS -shared -static-libstdc++ -Wl,--exclude-libs,ALL -Wl,-soname,libOplusAudioxAidl.so \
+            "${objs[@]}" dsp/spatial.cpp dsp/vocals.cpp effect/ally_effect.cpp \
+            -lbinder_ndk -llog -lm -ldl \
+            -o build_arm64/libOplusAudioxAidl.so
+
           echo "--- DT_NEEDED"
           "$NDK_BIN/llvm-readelf" -d build_arm64/liballysoundaidl.so | grep NEEDED
           echo "--- exported entry points"
-          "$NDK_BIN/llvm-nm" -D --defined-only build_arm64/liballysoundaidl.so \
+          "$NDK_BIN/llvm-nm" -D --defined-only build_arm64/libOplusAudioxAidl.so \
             | grep -E ' (queryEffect|createEffect|destroyEffect)$'
           ls -l build_arm64/liballysoundaidl.so
 
@@ -183,7 +190,7 @@ jobs:
           cp build_arm64/liballysoundaidl.so dist/module/vendor/lib64/soundfx/liballysoundaidl.so
           # same binary also answers for the Oplus "audiox" uuid: the vendor HAL only
           # loads libraries from its own list, so we take that slot over
-          cp build_arm64/liballysoundaidl.so dist/module/vendor/lib64/soundfx/libOplusAudioxAidl.so
+          cp build_arm64/libOplusAudioxAidl.so dist/module/vendor/lib64/soundfx/libOplusAudioxAidl.so
           cp onnxruntime/jni/arm64-v8a/libonnxruntime.so dist/module/vendor/lib64/libonnxruntime.so
           cp models/vocals.onnx dist/module/vendor/etc/allysound/vocals.onnx
           cp build_java/classes.dex dist/module/bin/AllySoundCtl.dex
