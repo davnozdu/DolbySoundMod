@@ -44,13 +44,15 @@ jobs:
 
           git clone --depth=1 --filter=blob:none --sparse https://android.googlesource.com/platform/system/hardware/interfaces aosp_sys_hw_if
           (cd aosp_sys_hw_if && git sparse-checkout set \
-            media/aidl/aidl_api/android.media.audio.common.types/current)
+            media/aidl/aidl_api/android.media.audio.common.types)
 
           mkdir -p aidl_src
           cp -r aosp_hw_if/common/aidl/aidl_api/android.hardware.common/2/* aidl_src/
           cp -r aosp_hw_if/common/fmq/aidl/aidl_api/android.hardware.common.fmq/1/* aidl_src/
           cp -r aosp_hw_if/audio/aidl/aidl_api/android.hardware.audio.effect/3/* aidl_src/
-          cp -r aosp_sys_hw_if/media/aidl_api/android.media.audio.common.types/current/* aidl_src/
+          LATEST_AUDIO_COMMON=$(ls -d aosp_sys_hw_if/media/aidl_api/android.media.audio.common.types/* | sort -V | tail -n 1)
+          echo "Using audio.common.types: $LATEST_AUDIO_COMMON"
+          cp -r "$LATEST_AUDIO_COMMON"/* aidl_src/
           find aidl_src -name "*.aidl" | head -n 30
 
       - name: Fetch ONNX Runtime Android (NNAPI) & StemgenRT model
