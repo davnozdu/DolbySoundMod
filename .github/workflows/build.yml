@@ -25,7 +25,6 @@ jobs:
           ./test_dsp
 
       - name: Locate Android NDK & Build-Tools
-        id: sdk
         run: |
           NDK_DIR=$(ls -d "$ANDROID_HOME/ndk/"* | sort -V | tail -n 1)
           BT_DIR=$(ls -d "$ANDROID_HOME/build-tools/"* | sort -V | tail -n 1)
@@ -38,19 +37,32 @@ jobs:
       - name: Fetch AOSP AIDL definitions
         run: |
           git clone --depth=1 --filter=blob:none --sparse https://android.googlesource.com/platform/hardware/interfaces aosp_hw_if
-          cd aosp_hw_if
-          git sparse-checkout set \
+          (cd aosp_hw_if && git sparse-checkout set \
             common/aidl/aidl_api/android.hardware.common/2 \
             common/fmq/aidl/aidl_api/android.hardware.common.fmq/1 \
-            audio/aidl/aidl_api/android.media.audio.common.types/5 \
-            audio/aidl/aidl_api/android.hardware.audio.effect/3
-          cd ..
+            audio/aidl/aidl_api/android.hardware.audio.effect/3)
+
+          git clone --depth=1 --filter=blob:none --sparse https://android.googlesource.com/platform/system/hardware/interfaces aosp_sys_hw_if
+          (cd aosp_sys_hw_if && git sparse-checkout set \
+            media/aidl/aidl_api/android.media.audio.common.types/5)
+
           mkdir -p aidl_src
           cp -r aosp_hw_if/common/aidl/aidl_api/android.hardware.common/2/* aidl_src/
           cp -r aosp_hw_if/common/fmq/aidl/aidl_api/android.hardware.common.fmq/1/* aidl_src/
-          cp -r aosp_hw_if/audio/aidl/aidl_api/android.media.audio.common.types/5/* aidl_src/
           cp -r aosp_hw_if/audio/aidl/aidl_api/android.hardware.audio.effect/3/* aidl_src/
+          cp -r aosp_sys_hw_if/media/aidl/aidl_api/android.media.audio.common.types/5/* aidl_src/
           find aidl_src -name "*.aidl" | head -n 30
+
+      - name: Fetch ONNX Runtime Android (NNAPI) & StemgenRT model
+        run: |
+          mkdir -p onnxruntime models
+          curl -fsSL -o onnxruntime/ort.aar \
+            "https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/1.20.0/onnxruntime-android-1.20.0.aar"
+          unzip -q onnxruntime/ort.aar "headers/*" "jni/arm64-v8a/libonnxruntime.so" -d onnxruntime/
+
+          curl -fsSL -o models/vocals.onnx \
+            "https://media.githubusercontent.com/media/sweetspotsoundsystem/stemgen-rt/main/model/parallel/vocals.onnx"
+          echo "f29a3d8fa596ce4672dd4dc77ccf224f2538389940264aad46ab8168311c2148  models/vocals.onnx" | sha256sum -c -
 
       - name: Compile AIDL to NDK C++
         run: |
@@ -62,13 +74,11 @@ jobs:
         run: |
           CC_BIN="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang++"
           mkdir -p build_arm64 stubs
-          CXXFLAGS="-std=c++17 -O3 -fPIC -fvisibility=default -D__ANDROID_API__=35 -D_LIBCPP_ABI_NAMESPACE=__1 -Iaidl_gen/include -Idsp -Ieffect"
+          CXXFLAGS="-std=c++17 -O3 -fPIC -fvisibility=default -D__ANDROID_API__=35 -D_LIBCPP_ABI_NAMESPACE=__1 -DALLY_ENABLE_NPU -Iaidl_gen/include -Idsp -Ieffect -Ionnxruntime/headers"
 
-          # Create empty libc++.so stub so DT_NEEDED is libc++.so (system/vendor libc++, std::__1)
           echo "" | "$CC_BIN" -x c -c - -o build_arm64/empty.o
           "$CC_BIN" -shared -nostdlib++ -Wl,-soname,libc++.so build_arm64/empty.o -o stubs/libc++.so
 
-          # Build stub shared libraries matching device SONAMEs
           compile_group() {
             local soname="$1"
             local pattern="$2"
@@ -90,15 +100,14 @@ jobs:
             "stubs/android.hardware.common.fmq-V1-ndk.so" \
             "stubs/android.hardware.common-V2-ndk.so"
 
-          # Build liballysoundaidl.so
           "$CC_BIN" $CXXFLAGS -shared -nostdlib++ -Wl,--allow-shlib-undefined \
-            dsp/spatial.cpp effect/ally_effect.cpp \
+            dsp/spatial.cpp dsp/vocals.cpp effect/ally_effect.cpp \
             stubs/android.hardware.audio.effect-V3-ndk.so \
             stubs/android.media.audio.common.types-V5-ndk.so \
             stubs/android.hardware.common.fmq-V1-ndk.so \
             stubs/android.hardware.common-V2-ndk.so \
             stubs/libc++.so \
-            -lbinder_ndk -llog -lm \
+            -lbinder_ndk -llog -lm -ldl \
             -o build_arm64/liballysoundaidl.so
 
       - name: Compile AllySoundCtl.dex
@@ -109,12 +118,18 @@ jobs:
 
       - name: Package KernelSU Module ZIP
         run: |
-          mkdir -p dist/module/vendor/lib64/soundfx dist/module/bin
+          VER_CODE=$((100 + GITHUB_RUN_NUMBER))
+          VER_STR="v1.0.${GITHUB_RUN_NUMBER}"
+          mkdir -p dist/module/vendor/lib64/soundfx dist/module/vendor/etc/allysound dist/module/bin
           cp -r module/* dist/module/
+          sed -i "s/^version=.*/version=${VER_STR}/" dist/module/module.prop
+          sed -i "s/^versionCode=.*/versionCode=${VER_CODE}/" dist/module/module.prop
           cp build_arm64/liballysoundaidl.so dist/module/vendor/lib64/soundfx/liballysoundaidl.so
+          cp onnxruntime/jni/arm64-v8a/libonnxruntime.so dist/module/vendor/lib64/libonnxruntime.so
+          cp models/vocals.onnx dist/module/vendor/etc/allysound/vocals.onnx
           cp build_java/classes.dex dist/module/bin/AllySoundCtl.dex
-          chmod 0755 dist/module/post-fs-data.sh dist/module/service.sh dist/module/uninstall.sh
-          chmod 0644 dist/module/vendor/lib64/soundfx/liballysoundaidl.so dist/module/bin/AllySoundCtl.dex
+          chmod 0755 dist/module/post-fs-data.sh dist/module/service.sh dist/module/uninstall.sh dist/module/bin/check_update.sh
+          chmod 0644 dist/module/vendor/lib64/soundfx/liballysoundaidl.so dist/module/vendor/lib64/libonnxruntime.so dist/module/vendor/etc/allysound/vocals.onnx dist/module/bin/AllySoundCtl.dex
           (cd dist/module && zip -r9 ../../AllySoundKSU.zip .)
 
       - name: Upload Artifact
@@ -129,3 +144,21 @@ jobs:
           tag_name: v1.0.${{ github.run_number }}
           name: AllySoundKSU v1.0.${{ github.run_number }}
           files: AllySoundKSU.zip
+
+      - name: Update update.json on main
+        run: |
+          VER_CODE=$((100 + GITHUB_RUN_NUMBER))
+          VER_STR="v1.0.${GITHUB_RUN_NUMBER}"
+          cat <<EOF > update.json
+          {
+            "version": "${VER_STR}",
+            "versionCode": ${VER_CODE},
+            "zipUrl": "https://github.com/davnozdu/ally-sound-ksu/releases/latest/download/AllySoundKSU.zip",
+            "changelog": "https://raw.githubusercontent.com/davnozdu/ally-sound-ksu/main/README.md"
+          }
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add update.json
+          git commit -m "chore: bump update.json to ${VER_STR} [skip ci]" || true
+          git push

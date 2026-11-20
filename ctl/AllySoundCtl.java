@@ -19,12 +19,14 @@ public class AllySoundCtl {
     private static final String BASE_DIR = "/data/adb/allysound";
     private static final String APPS_CONF = BASE_DIR + "/apps.conf";
     private static final String DEVICE_CONF = BASE_DIR + "/device.conf";
+    private static final String NEURAL_CONF = BASE_DIR + "/neural.conf";
     private static final String STATUS_JSON = BASE_DIR + "/status.json";
 
     private static class SessionEffect {
         AudioEffect effect;
         String pkg;
         int profile;
+        int neural;
         int device;
     }
 
@@ -85,6 +87,17 @@ public class AllySoundCtl {
             return line != null ? line.trim().toLowerCase() : "auto";
         } catch (Exception e) {
             return "auto";
+        }
+    }
+
+    private static int readNeuralEnabled() {
+        File f = new File(NEURAL_CONF);
+        if (!f.exists()) return 0;
+        try (BufferedReader br = new BufferedReader(new FileReader(f))) {
+            String line = br.readLine();
+            return (line != null && "1".equals(line.trim())) ? 1 : 0;
+        } catch (Exception e) {
+            return 0;
         }
     }
 
@@ -163,10 +176,10 @@ public class AllySoundCtl {
         return ctor.newInstance(TYPE_LOUDNESS, IMPL_ALLY, 0, sessionId);
     }
 
-    private static void setAllyParam(AudioEffect fx, int profile, int device) throws Exception {
+    private static void setAllyParam(AudioEffect fx, int profile, int neural, int device) throws Exception {
         Method setParam = AudioEffect.class.getDeclaredMethod("setParameter", int.class, int.class);
         setParam.setAccessible(true);
-        int code = 10000 + profile * 10 + device;
+        int code = 10000 + profile * 100 + neural * 10 + device;
         setParam.invoke(fx, 0 /* PARAM_TARGET_GAIN_MB */, code);
     }
 
@@ -200,6 +213,7 @@ public class AllySoundCtl {
                 Map<String, Integer> apps = readAppsConf();
                 String devMode = readDeviceMode();
                 int device = detectOutputDevice(devMode);
+                int neural = readNeuralEnabled();
                 Map<Integer, String> sessions = readActiveSessions();
 
                 // Remove stale or disabled sessions
@@ -230,22 +244,24 @@ public class AllySoundCtl {
                     if (se == null) {
                         try {
                             AudioEffect fx = createAllyEffect(sid);
-                            setAllyParam(fx, prof, device);
+                            setAllyParam(fx, prof, neural, device);
                             fx.setEnabled(true);
                             se = new SessionEffect();
                             se.effect = fx;
                             se.pkg = pkg;
                             se.profile = prof;
+                            se.neural = neural;
                             se.device = device;
                             active.put(sid, se);
                             lastError = null;
                         } catch (Exception e) {
                             lastError = e.getClass().getSimpleName() + ": " + e.getMessage();
                         }
-                    } else if (se.profile != prof || se.device != device) {
+                    } else if (se.profile != prof || se.neural != neural || se.device != device) {
                         try {
-                            setAllyParam(se.effect, prof, device);
+                            setAllyParam(se.effect, prof, neural, device);
                             se.profile = prof;
+                            se.neural = neural;
                             se.device = device;
                             lastError = null;
                         } catch (Exception e) {

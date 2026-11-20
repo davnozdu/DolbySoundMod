@@ -1,6 +1,7 @@
 #pragma once
 
 #include "fft.hpp"
+#include "vocals.hpp"
 #include <array>
 #include <complex>
 #include <cstdint>
@@ -138,11 +139,13 @@ public:
 
     void set_profile(Profile p);
     void set_device(DeviceKind d);
+    void set_neural(bool enabled) { neural_ = enabled; }
     void set_reverb(bool enabled) { reverb_ = enabled; }
     void set_bypass(bool bypass) { bypass_ = bypass; }
 
     Profile profile() const { return profile_; }
     DeviceKind device() const { return device_; }
+    bool neural() const { return neural_; }
 
     // Process arbitrary number of interleaved float frames (2, 6, or 8 channels).
     // Output is always interleaved stereo float frames.
@@ -154,6 +157,11 @@ private:
     DeviceKind device_ = DeviceKind::Headphones;
     bool reverb_ = true;
     bool bypass_ = false;
+    bool neural_ = false;
+    uint64_t tick_ = 0;
+
+    PipelinedVocals vocals_;
+    BiquadFilter cinema_air_;
 
     Convolver direct_;
     Convolver room_;

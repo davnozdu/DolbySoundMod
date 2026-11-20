@@ -95,6 +95,7 @@ public:
         renderer_.init(sample_rate_);
         renderer_.set_profile(profile_.load());
         renderer_.set_device(device_.load());
+        renderer_.set_neural(neural_.load());
 
         if (specific.has_value()) {
             apply_specific_locked(*specific);
@@ -206,6 +207,7 @@ private:
     std::atomic<State> state_{State::INIT};
     std::atomic<ally::Profile> profile_{ally::Profile::Game};
     std::atomic<ally::DeviceKind> device_{ally::DeviceKind::Headphones};
+    std::atomic<bool> neural_{false};
     std::atomic<bool> worker_running_{false};
     std::thread worker_;
 
@@ -221,26 +223,32 @@ private:
     ally::FmqQueue<float> out_mq_;
 
     int32_t encoded_gain_mb() const {
-        return 10000 + static_cast<int>(profile_.load()) * 10 + static_cast<int>(device_.load());
+        return 10000 + static_cast<int>(profile_.load()) * 100
+             + (neural_.load() ? 10 : 0)
+             + static_cast<int>(device_.load());
     }
 
     void apply_specific_locked(const Parameter::Specific& spec) {
         if (spec.getTag() == Parameter::Specific::loudnessEnhancer) {
             int32_t val = spec.get<Parameter::Specific::loudnessEnhancer>().gainMb;
-            if (val >= 10000 && val < 10100) {
-                int p = (val - 10000) / 10;
-                int d = (val - 10000) % 10;
+            if (val >= 10000 && val < 11000) {
+                int rem = val - 10000;
+                int p = rem / 100;
+                int n = (rem / 10) % 10;
+                int d = rem % 10;
                 if (p >= 0 && p <= 3) {
                     auto prof = static_cast<ally::Profile>(p);
                     profile_.store(prof);
                     renderer_.set_profile(prof);
                 }
+                neural_.store(n != 0);
+                renderer_.set_neural(n != 0);
                 if (d >= 0 && d <= 2) {
                     auto dev = static_cast<ally::DeviceKind>(d);
                     device_.store(dev);
                     renderer_.set_device(dev);
                 }
-                ALOGI("Updated params: profile=%d device=%d", p, d);
+                ALOGI("Updated params: profile=%d neural=%d device=%d", p, n, d);
             }
         }
     }

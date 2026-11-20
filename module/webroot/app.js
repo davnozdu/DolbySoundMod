@@ -1,7 +1,10 @@
 const DATA_DIR = '/data/adb/allysound';
 const APPS_CONF = `${DATA_DIR}/apps.conf`;
 const DEVICE_CONF = `${DATA_DIR}/device.conf`;
+const NEURAL_CONF = `${DATA_DIR}/neural.conf`;
+const AUTO_UPDATE_CONF = `${DATA_DIR}/auto_update.conf`;
 const STATUS_JSON = `${DATA_DIR}/status.json`;
+const MOD_DIR = '/data/adb/modules/allysound';
 
 let appProfiles = {}; // { pkg: 'game' | 'movie' | 'music' | 'off' }
 let deviceMode = 'auto';
@@ -37,6 +40,10 @@ async function loadConfig() {
     }
     const devRaw = (await execCmd(`cat "${DEVICE_CONF}" 2>/dev/null || echo auto`)).trim();
     deviceMode = ['auto', 'headphones', 'speakers', 'glasses'].includes(devRaw) ? devRaw : 'auto';
+    const neuralRaw = (await execCmd(`cat "${NEURAL_CONF}" 2>/dev/null || echo 0`)).trim();
+    document.getElementById('toggle-neural').checked = (neuralRaw === '1');
+    const autoUpdRaw = (await execCmd(`cat "${AUTO_UPDATE_CONF}" 2>/dev/null || echo 1`)).trim();
+    document.getElementById('toggle-autoupdate').checked = (autoUpdRaw !== '0');
   } catch (e) {
     console.error(e);
   }
@@ -208,6 +215,37 @@ document.getElementById('btn-close-modal').onclick = () => {
   document.getElementById('app-modal').classList.add('hidden');
 };
 document.getElementById('app-search').oninput = (e) => renderPickerList(e.target.value);
+
+document.getElementById('toggle-neural').onchange = async (e) => {
+  const v = e.target.checked ? '1' : '0';
+  await execCmd(`mkdir -p "${DATA_DIR}" && echo "${v}" > "${NEURAL_CONF}"`);
+};
+
+document.getElementById('toggle-autoupdate').onchange = async (e) => {
+  const v = e.target.checked ? '1' : '0';
+  await execCmd(`mkdir -p "${DATA_DIR}" && echo "${v}" > "${AUTO_UPDATE_CONF}"`);
+};
+
+document.getElementById('btn-check-update').onclick = async () => {
+  const sub = document.getElementById('update-sub');
+  const btn = document.getElementById('btn-check-update');
+  btn.disabled = true;
+  sub.textContent = 'Проверка обновлений на GitHub...';
+  try {
+    const out = (await execCmd(`sh "${MOD_DIR}/bin/check_update.sh"`)).trim();
+    if (out.startsWith('UP_TO_DATE:')) {
+      sub.textContent = 'Установлена последняя версия.';
+    } else if (out.startsWith('UPDATED:')) {
+      sub.textContent = `Обновлено до ${out.split(':')[1]}! Перезагрузите устройство.`;
+    } else {
+      sub.textContent = `Статус: ${out || 'ошибка проверки'}`;
+    }
+  } catch (e) {
+    sub.textContent = 'Не удалось проверить обновления.';
+  } finally {
+    btn.disabled = false;
+  }
+};
 
 loadConfig();
 pollStatus();

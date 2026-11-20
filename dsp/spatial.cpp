@@ -507,6 +507,7 @@ void Renderer::init(float sample_rate) {
     lfe_filter_.configure_lowpass_2nd(120.0f, sample_rate, 1);
     speaker_lfe_.configure_lowpass_2nd(120.0f, sample_rate, 1);
     glasses_bass_.configure_lowpass_2nd(220.0f, sample_rate, 2);
+    cinema_air_.configure_highpass_2nd(4500.0f, sample_rate, 2);
     widener_.init(sample_rate);
     dynamics_.init(sample_rate);
 
@@ -522,6 +523,7 @@ void Renderer::reset() {
     lfe_filter_.reset();
     speaker_lfe_.reset();
     glasses_bass_.reset();
+    cinema_air_.reset();
     widener_.reset();
     dynamics_.reset();
     clock_ = 0.0;
@@ -578,6 +580,45 @@ void Renderer::make_stereo_feeds(bool& has_lfe) {
 
     std::array<float, 2 * kHop> amb{};
     std::array<float, 2 * kHop> rear{};
+
+#ifdef ALLY_ENABLE_NPU
+    if (neural_ && profile_ == Profile::Movie &&
+        vocals_.ensure_loaded("/vendor/etc/allysound/vocals.onnx", true)) {
+        std::array<float, 2 * kHop> dry{};
+        std::array<float, 2 * kHop> sep_rest{};
+        vocals_.process(&block_[0], dry.data(), sep_rest.data(), tick_);
+
+        std::array<float, kHop> air_l{}, air_r{};
+        cinema_air_.process(&sep_rest[0], air_l.data(), 0, kHop);
+        cinema_air_.process(&sep_rest[kHop], air_r.data(), 1, kHop);
+
+        for (int i = 0; i < kHop; ++i) {
+            float vl = (dry[i] - sep_rest[i]) * 0.75f;
+            float vr = (dry[kHop + i] - sep_rest[kHop + i]) * 0.75f;
+            float al = air_l[i] * 0.26f;
+            float ar = air_r[i] * 0.26f;
+            float rl = dry[i] - vl + al;
+            float rr = dry[kHop + i] - vr + ar;
+            float amb_l = sep_rest[i] + al;
+            float amb_r = sep_rest[kHop + i] + ar;
+            feeds_[0 * kHop + i] = rl;
+            feeds_[1 * kHop + i] = rr;
+            feeds_[2 * kHop + i] = 0.5f * (vl + vr) * cfg.dialogue;
+            amb[0 * kHop + i] = amb_l - 0.7f * amb_r;
+            amb[1 * kHop + i] = amb_r - 0.7f * amb_l;
+            lfe_[i] = 0.5f * (sep_rest[i] + sep_rest[kHop + i]) * 0.25f;
+        }
+        has_lfe = true;
+        ambience_delay_.process(amb.data(), rear.data(), kHop);
+        for (int i = 0; i < kHop; ++i) {
+            feeds_[3 * kHop + i] = rear[0 * kHop + i] * 0.52f;
+            feeds_[4 * kHop + i] = rear[1 * kHop + i] * 0.52f;
+            feeds_[5 * kHop + i] = amb[0 * kHop + i] * 0.58f;
+            feeds_[6 * kHop + i] = amb[1 * kHop + i] * 0.58f;
+        }
+        return;
+    }
+#endif
 
     for (int i = 0; i < kHop; ++i) {
         float mid = 0.5f * (fl[i] + fr[i]);
@@ -720,6 +761,7 @@ void Renderer::downmix(float* out_l, float* out_r) {
 }
 
 void Renderer::process_hop() {
+    tick_++;
     if (profile_ == Profile::Off) {
         std::memcpy(out_fifo_[0].data(), &block_[0 * kHop], kHop * sizeof(float));
         std::memcpy(out_fifo_[1].data(), &block_[1 * kHop], kHop * sizeof(float));

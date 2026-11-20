@@ -28,6 +28,31 @@
     </section>
 
     <section class="card">
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-title">Нейросеть (NPU)</div>
+          <div class="toggle-sub">StemgenRT для выделения диалогов в профиле «Фильм»</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="toggle-neural" />
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="divider"></div>
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-title">Автообновление</div>
+          <div class="toggle-sub" id="update-sub">Подтягивать новые версии с GitHub автоматически</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="toggle-autoupdate" checked />
+          <span class="slider"></span>
+        </label>
+      </div>
+      <button id="btn-check-update" class="btn-secondary">Проверить обновления сейчас</button>
+    </section>
+
+    <section class="card">
       <div class="card-header">
         <div class="card-title">Приложения</div>
         <button id="btn-pick-app" class="btn-primary">+ Выбрать приложение</button>
