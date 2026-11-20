@@ -9,6 +9,7 @@
 #include <android/log.h>
 
 #include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <cstring>
 #include <memory>
@@ -321,8 +322,12 @@ private:
         std::vector<float> stereo_buf;
         std::vector<float> out_buf;
 
+        uint64_t stat_buffers = 0, stat_timeouts = 0, stat_wait_us = 0, stat_proc_us = 0;
+        auto last_stat = std::chrono::steady_clock::now();
         while (worker_running_.load()) {
-            in_mq_.wait(1, 20);
+            auto t_wait0 = std::chrono::steady_clock::now();
+            if (!in_mq_.wait(1, 20)) stat_timeouts++;
+            auto t_proc0 = std::chrono::steady_clock::now();
             if (!worker_running_.load()) break;
 
             // Process exactly one buffer per status message: that is what the HAL
@@ -375,6 +380,20 @@ private:
                     if (out_channels_ > 1) out_buf[i * out_channels_ + 1] = stereo_buf[2 * i + 1];
                 }
                 out_mq_.write(out_buf.data(), frames * out_channels_);
+            }
+
+            auto t_end = std::chrono::steady_clock::now();
+            stat_buffers++;
+            stat_wait_us += std::chrono::duration_cast<std::chrono::microseconds>(t_proc0 - t_wait0).count();
+            stat_proc_us += std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_proc0).count();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(t_end - last_stat).count() >= 2000) {
+                ALOGI("effect stats: buffers=%llu timeouts=%llu avg_wait=%lluus avg_proc=%lluus state=%d",
+                      (unsigned long long)stat_buffers, (unsigned long long)stat_timeouts,
+                      (unsigned long long)(stat_buffers ? stat_wait_us / stat_buffers : 0),
+                      (unsigned long long)(stat_buffers ? stat_proc_us / stat_buffers : 0),
+                      (int)state_.load());
+                stat_buffers = stat_timeouts = stat_wait_us = stat_proc_us = 0;
+                last_stat = t_end;
             }
 
             IEffect::Status st{};
