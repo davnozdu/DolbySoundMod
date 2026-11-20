@@ -4,8 +4,10 @@ import java.io.File;
 import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.InputStreamReader;
+import java.io.RandomAccessFile;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
+import java.nio.channels.FileLock;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -129,8 +131,8 @@ public class AllySoundCtl {
                     }
                 }
             }
-            p.waitFor();
-            return detected;
+            p.destroy();  // never waitFor() after an early break: dumpsys keeps
+            return detected;  // writing into the pipe and waitFor() deadlocks
         } catch (Exception e) {
             return 0;
         }
@@ -164,7 +166,8 @@ public class AllySoundCtl {
                     }
                 }
             }
-            p.waitFor();
+            p.destroy();  // an early break leaves dumpsys blocked on a full pipe;
+                          // waitFor() would then hang the whole control loop
         } catch (Exception ignored) {}
         return sessions;
     }
@@ -207,6 +210,19 @@ public class AllySoundCtl {
 
     public static void main(String[] args) {
         new File(BASE_DIR).mkdirs();
+        // Single instance only: the service.sh supervisor restarts us every 3s,
+        // and two controllers would attach two effects to the same session.
+        RandomAccessFile lockFile = null;
+        FileLock lock = null;
+        try {
+            lockFile = new RandomAccessFile(BASE_DIR + "/ctl.lock", "rw");
+            lock = lockFile.getChannel().tryLock();
+            if (lock == null) {
+                return;
+            }
+        } catch (Exception ignored) {
+            // lock is best effort; never block the controller
+        }
         String lastError = null;
         while (true) {
             try {

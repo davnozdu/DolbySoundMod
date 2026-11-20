@@ -55,10 +55,7 @@ fi
     fi
 ) &
 
-# Persistent per-app audio session controller
-(
-    while true; do
-        CLASSPATH="$MODDIR/bin/AllySoundCtl.dex" /system/bin/app_process64 /system/bin AllySoundCtl >/dev/null 2>&1
-        sleep 3
-    done
-) &
+# Persistent per-app audio session controller. setsid + nohup keep the
+# supervisor alive on its own so it is not killed together with this script's
+# process group; AllySoundCtl locks itself, so extra restarts are harmless.
+nohup setsid sh -c "while true; do CLASSPATH=\"$MODDIR/bin/AllySoundCtl.dex\" /system/bin/app_process64 /system/bin AllySoundCtl >/dev/null 2>&1; sleep 3; done" >/dev/null 2>&1 &
