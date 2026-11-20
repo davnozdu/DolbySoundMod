@@ -34,7 +34,7 @@ using aidl::android::media::audio::common::AudioUuid;
 // never matched the configured UUID and the HAL dropped the effect.
 // Implementation UUID: a117500d-0001-4000-8000-000000000001
 const AudioUuid kImplUuid = {
-    0xa117500d,
+    static_cast<int32_t>(0xa117500d),
     0x0001,
     0x4000,
     0x8000,
@@ -44,7 +44,7 @@ const AudioUuid kImplUuid = {
 // Type UUID: LoudnessEnhancer (fe3199be-aed0-413f-87bb-11260eb63cf1)
 // Universally accepted by AudioFlinger on any MIXER session.
 const AudioUuid kTypeUuid = {
-    0xfe3199be,
+    static_cast<int32_t>(0xfe3199be),
     0xaed0,
     0x413f,
     0x87bb,
