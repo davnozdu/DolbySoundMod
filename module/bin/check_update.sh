@@ -1,8 +1,8 @@
 #!/system/bin/sh
 MODDIR="/data/adb/modules/allysound"
-UPDATE_URL="https://raw.githubusercontent.com/davnozdu/ally-sound-ksu/main/update.json"
+UPDATE_URL="https://raw.githubusercontent.com/davnozdu/DolbySoundMod/main/update.json"
 TMP_JSON="/data/local/tmp/allysound_update.json"
-TMP_ZIP="/data/local/tmp/AllySoundKSU.zip"
+TMP_ZIP="/data/local/tmp/DolbySoundMod.zip"
 
 CUR_CODE=$(grep -E '^versionCode=' "$MODDIR/module.prop" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
 [ -n "$CUR_CODE" ] || CUR_CODE=0

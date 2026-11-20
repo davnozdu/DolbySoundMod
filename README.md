@@ -1,4 +1,4 @@
-# Ally Sound Lab (KernelSU)
+# DolbySoundMod (KernelSU)
 
 Порт бинаурального 7.1 / HRTF-аудиопроцессора из Ally Sound Lab на Android в виде независимого модуля KernelSU с выбором приложений через WebUI.
 

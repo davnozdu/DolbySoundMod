@@ -1,4 +1,4 @@
-name: Build AllySoundKSU
+name: Build DolbySoundMod
 
 on:
   push:
@@ -130,20 +130,20 @@ jobs:
           cp build_java/classes.dex dist/module/bin/AllySoundCtl.dex
           chmod 0755 dist/module/post-fs-data.sh dist/module/service.sh dist/module/uninstall.sh dist/module/bin/check_update.sh
           chmod 0644 dist/module/vendor/lib64/soundfx/liballysoundaidl.so dist/module/vendor/lib64/libonnxruntime.so dist/module/vendor/etc/allysound/vocals.onnx dist/module/bin/AllySoundCtl.dex
-          (cd dist/module && zip -r9 ../../AllySoundKSU.zip .)
+          (cd dist/module && zip -r9 ../../DolbySoundMod.zip .)
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AllySoundKSU
-          path: AllySoundKSU.zip
+          name: DolbySoundMod
+          path: DolbySoundMod.zip
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.0.${{ github.run_number }}
-          name: AllySoundKSU v1.0.${{ github.run_number }}
-          files: AllySoundKSU.zip
+          name: DolbySoundMod v1.0.${{ github.run_number }}
+          files: DolbySoundMod.zip
 
       - name: Update update.json on main
         run: |
@@ -153,8 +153,8 @@ jobs:
           {
             "version": "${VER_STR}",
             "versionCode": ${VER_CODE},
-            "zipUrl": "https://github.com/davnozdu/ally-sound-ksu/releases/latest/download/AllySoundKSU.zip",
-            "changelog": "https://raw.githubusercontent.com/davnozdu/ally-sound-ksu/main/README.md"
+            "zipUrl": "https://github.com/davnozdu/DolbySoundMod/releases/latest/download/DolbySoundMod.zip",
+            "changelog": "https://raw.githubusercontent.com/davnozdu/DolbySoundMod/main/README.md"
           }
           EOF
           git config user.name "github-actions[bot]"
