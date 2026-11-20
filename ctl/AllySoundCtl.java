@@ -213,11 +213,13 @@ public class AllySoundCtl {
                 if (!line.contains("state:started")) continue;
                 if (log != null) log.append("hit: ").append(line).append('\n');
                 int sid = intAfter(line, "sessionId:");
-                // "u/pid:10206/6523" is uid/pid; the pid is what /proc knows about.
+                // "u/pid:10206/6523" is uid/pid; the pid is what /proc knows about. Search for
+                // the separator after the colon: the key itself starts with "u/".
                 int upid = line.indexOf("u/pid:");
                 int pid = -1;
                 if (upid >= 0) {
-                    int slash = line.indexOf('/', upid);
+                    int colon = line.indexOf(':', upid);
+                    int slash = (colon > 0) ? line.indexOf('/', colon) : -1;
                     if (slash > 0) {
                         int i = slash + 1;
                         int start = i;
