@@ -310,7 +310,7 @@ private:
 
     void stop_worker_locked() {
         if (worker_running_.exchange(false)) {
-            in_mq_.wake(1);
+            in_mq_.wake(0x02);
             if (worker_.joinable()) {
                 worker_.join();
             }
@@ -409,7 +409,10 @@ private:
             st.fmqConsumed = static_cast<int32_t>(frames * in_channels_);
             st.fmqProduced = static_cast<int32_t>(frames * out_channels_);
             status_mq_.write(&st, 1);
-            status_mq_.wake(1);
+            // libfmq's statusQ->readBlocking() (what AudioFlinger calls) waits on
+            // FMQ_NOT_EMPTY == 0x02; waking bit 1 left it blocked forever, which is the
+            // frozen playback the device showed.
+            status_mq_.wake(0x02);
         }
     }
 };
