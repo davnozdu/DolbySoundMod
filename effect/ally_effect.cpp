@@ -325,14 +325,17 @@ private:
             in_mq_.wait(1, 20);
             if (!worker_running_.load()) break;
 
-            size_t avail_in = in_mq_.available_to_read();
-            if (avail_in < static_cast<size_t>(in_channels_)) {
+            // Process exactly one buffer per status message: that is what the HAL
+            // wrote, and a short or oversized reply makes it wait for the missing
+            // frames, which is audible as a hiccup.
+            const size_t want_frames = frame_count_ > 0 ? frame_count_ : 1024;
+            const size_t need_in = want_frames * static_cast<size_t>(in_channels_);
+            const size_t need_out = want_frames * static_cast<size_t>(out_channels_);
+            if (static_cast<size_t>(in_mq_.available_to_read()) < need_in ||
+                static_cast<size_t>(out_mq_.available_to_write()) < need_out) {
                 continue;
             }
-            size_t frames = avail_in / static_cast<size_t>(in_channels_);
-            size_t avail_out_frames = out_mq_.available_to_write() / static_cast<size_t>(out_channels_);
-            frames = std::min(frames, avail_out_frames);
-            if (frames == 0) continue;
+            size_t frames = want_frames;
 
             in_buf.resize(frames * in_channels_);
             stereo_buf.resize(frames * 2);
