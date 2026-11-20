@@ -27,6 +27,13 @@ mkdir -p "$DATA_DIR" 2>/dev/null
 : > "$LOG" 2>/dev/null
 log() { echo "$*" >> "$LOG" 2>/dev/null; }
 
+# Global kill switch: /data/adb/allysound/disable makes the module inert - no
+# mounts, no config patches, no controller. Reboot to apply.
+if [ -f "$DATA_DIR/disable" ]; then
+    log "disable flag present: module is inert"
+    exit 0
+fi
+
 # Non-destructively patch audio_effects_config.xml so we never break AutoSystemBoost or stock effects.
 patch_xml() {
     SRC="$1"

@@ -4,6 +4,9 @@ MODDIR=${0%/*}
 
 DATA_DIR="/data/adb/allysound"
 mkdir -p "$DATA_DIR"
+if [ -f "$DATA_DIR/disable" ]; then
+    exit 0   # kill switch: module is inert
+fi
 [ -f "$DATA_DIR/apps.conf" ] || touch "$DATA_DIR/apps.conf"
 [ -f "$DATA_DIR/device.conf" ] || echo "auto" > "$DATA_DIR/device.conf"
 [ -f "$DATA_DIR/neural.conf" ] || echo "0" > "$DATA_DIR/neural.conf"
