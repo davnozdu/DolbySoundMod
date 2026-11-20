@@ -37,17 +37,19 @@ jobs:
 
       - name: Fetch AOSP AIDL definitions
         run: |
+          git clone --depth=1 --filter=blob:none --sparse https://android.googlesource.com/platform/hardware/interfaces aosp_hw_if
+          cd aosp_hw_if
+          git sparse-checkout set \
+            common/aidl/aidl_api/android.hardware.common/2 \
+            common/fmq/aidl/aidl_api/android.hardware.common.fmq/1 \
+            audio/aidl/aidl_api/android.media.audio.common.types/5 \
+            audio/aidl/aidl_api/android.hardware.audio.effect/3
+          cd ..
           mkdir -p aidl_src
-          fetch_aidl() {
-            local url="$1"
-            local dst="$2"
-            mkdir -p "$dst"
-            curl -fsSL "$url" | tar -xz -C "$dst"
-          }
-          fetch_aidl "https://android.googlesource.com/platform/hardware/interfaces/+archive/refs/heads/main/common/aidl/aidl_api/android.hardware.common/2.tar.gz" aidl_src
-          fetch_aidl "https://android.googlesource.com/platform/hardware/interfaces/+archive/refs/heads/main/common/fmq/aidl/aidl_api/android.hardware.common.fmq/1.tar.gz" aidl_src
-          fetch_aidl "https://android.googlesource.com/platform/hardware/interfaces/+archive/refs/heads/main/audio/aidl/aidl_api/android.media.audio.common.types/5.tar.gz" aidl_src
-          fetch_aidl "https://android.googlesource.com/platform/hardware/interfaces/+archive/refs/heads/main/audio/aidl/aidl_api/android.hardware.audio.effect/3.tar.gz" aidl_src
+          cp -r aosp_hw_if/common/aidl/aidl_api/android.hardware.common/2/* aidl_src/
+          cp -r aosp_hw_if/common/fmq/aidl/aidl_api/android.hardware.common.fmq/1/* aidl_src/
+          cp -r aosp_hw_if/audio/aidl/aidl_api/android.media.audio.common.types/5/* aidl_src/
+          cp -r aosp_hw_if/audio/aidl/aidl_api/android.hardware.audio.effect/3/* aidl_src/
           find aidl_src -name "*.aidl" | head -n 30
 
       - name: Compile AIDL to NDK C++
