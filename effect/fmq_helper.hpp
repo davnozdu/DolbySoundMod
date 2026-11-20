@@ -90,12 +90,17 @@ public:
         return true;
     }
 
-    bool init(size_t count) {
+    // Stock effect libraries on this ROM describe their data queues WITHOUT an event
+    // flag grantor (3 grantors) and keep the event flag word only on the status queue
+    // (4 grantors, one element, word 8-byte aligned after the data). Mirroring that
+    // exactly is what makes AudioFlinger able to build its event flag group.
+    bool init(size_t count, bool with_event_flag = true) {
         reset();
         count_ = count;
+        with_event_flag_ = with_event_flag;
         data_bytes_ = count * sizeof(T);
         size_t aligned_data = (data_bytes_ + 7) & ~size_t(7);
-        total_bytes_ = 16 + aligned_data + 4; // readPtr(8) + writePtr(8) + data + eventFlag(4)
+        total_bytes_ = 16 + aligned_data + (with_event_flag ? 4 : 0);
 
         errno = 0;
         // Prefer the platform allocator: it is the same path libfmq uses for the stock
@@ -139,7 +144,9 @@ public:
         read_ptr_ = reinterpret_cast<std::atomic<uint64_t>*>(base_ + 0);
         write_ptr_ = reinterpret_cast<std::atomic<uint64_t>*>(base_ + 8);
         data_ = base_ + 16;
-        event_flag_ = reinterpret_cast<std::atomic<uint32_t>*>(base_ + 16 + aligned_data);
+        event_flag_ = with_event_flag
+                ? reinterpret_cast<std::atomic<uint32_t>*>(base_ + 16 + aligned_data)
+                : nullptr;
         return true;
     }
 
@@ -169,13 +176,17 @@ public:
         // makes the client build an *unsynchronized* queue, which has no event
         // flag word - AudioFlinger then reports "<name> invalid efGroup" on every
         // buffer and never touches our queues.
-        desc.flags = 0; // SynchronizedReadWrite
-        desc.grantors.resize(4);
+        // The stock libraries report 1 here; keep the same value so the client builds
+        // the same flavor of queue we do.
+        desc.flags = 1;
+        desc.grantors.resize(with_event_flag_ ? 4 : 3);
         desc.grantors[0] = {0, 0, 8};
         desc.grantors[1] = {0, 8, 8};
         desc.grantors[2] = {0, 16, static_cast<int64_t>(data_bytes_)};
-        size_t aligned_data = (data_bytes_ + 7) & ~size_t(7);
-        desc.grantors[3] = {0, static_cast<int32_t>(16 + aligned_data), 4};
+        if (with_event_flag_) {
+            size_t aligned_data = (data_bytes_ + 7) & ~size_t(7);
+            desc.grantors[3] = {0, static_cast<int32_t>(16 + aligned_data), 4};
+        }
 
         int dup_fd = fcntl(fd_, F_DUPFD_CLOEXEC, 0);
         desc.handle.fds.emplace_back(ndk::ScopedFileDescriptor(dup_fd));
@@ -231,7 +242,12 @@ public:
     }
 
     bool wait(uint32_t bitmask = 1, int timeout_ms = 50) {
-        if (!event_flag_) return false;
+        if (!event_flag_) {
+            // No shared event flag (data queues): poll the pointers instead, otherwise
+            // the caller spins without ever yielding the CPU.
+            usleep(1000);
+            return available_to_read() > 0;
+        }
         uint32_t cur = event_flag_->load(std::memory_order_acquire);
         if (cur & bitmask) {
             event_flag_->fetch_and(~bitmask, std::memory_order_acq_rel);
@@ -259,6 +275,7 @@ private:
     std::atomic<uint64_t>* write_ptr_ = nullptr;
     uint8_t* data_ = nullptr;
     std::atomic<uint32_t>* event_flag_ = nullptr;
+    bool with_event_flag_ = true;
 };
 
 } // namespace ally
