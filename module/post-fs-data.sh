@@ -178,6 +178,10 @@ patch_sku_effects() {
 stage_odm_soundfx() {
     SRC=/odm/lib64/soundfx
     [ -d "$SRC" ] || { log "no $SRC"; return 0; }
+    if [ -f "$DATA_DIR/disable_oplus" ]; then
+        log "oplus slot skipped: disable_oplus flag present"
+        return 0
+    fi
     OURS="$MODDIR/vendor/lib64/soundfx/libOplusAudioxAidl.so"
     [ -f "$OURS" ] || { log "no $OURS"; return 0; }
     OSTAGE="$DATA_DIR/odmsfx_stage"

@@ -33,6 +33,7 @@ public class AllySoundCtl {
     }
 
     private static final Map<Integer, SessionEffect> active = new HashMap<>();
+    private static final Map<Integer, Long> failedAt = new HashMap<>();
 
     private static int parseProfile(String s) {
         if (s == null) return 0;
@@ -258,6 +259,10 @@ public class AllySoundCtl {
 
                     SessionEffect se = active.get(sid);
                     if (se == null) {
+                        // Do not hammer AudioFlinger: one attempt per 15 s per session
+                        // while the effect cannot be created.
+                        Long failed = failedAt.get(sid);
+                        if (failed != null && System.currentTimeMillis() - failed < 15000) continue;
                         try {
                             AudioEffect fx = createAllyEffect(sid);
                             setAllyParam(fx, prof, neural, device);
@@ -269,8 +274,10 @@ public class AllySoundCtl {
                             se.neural = neural;
                             se.device = device;
                             active.put(sid, se);
+                            failedAt.remove(sid);
                             lastError = null;
                         } catch (Exception e) {
+                            failedAt.put(sid, System.currentTimeMillis());
                             lastError = e.getClass().getSimpleName() + ": " + e.getMessage();
                         }
                     } else if (se.profile != prof || se.neural != neural || se.device != device) {
