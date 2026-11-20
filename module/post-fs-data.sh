@@ -213,5 +213,18 @@ install_model
 stage_soundfx
 stage_odm_soundfx
 patch_sku_effects
-[ -f "$MODDIR/sepolicy.rule" ] && log "sepolicy.rule shipped ($(grep -c '^allow' "$MODDIR/sepolicy.rule") rules)"
+# KernelSU Next does not apply module sepolicy.rule files by itself on this build,
+# so push them through its own tool and keep the result in the log.
+if [ -f "$MODDIR/sepolicy.rule" ]; then
+    KSUD=/data/adb/ksu/bin/ksud
+    if [ -x "$KSUD" ]; then
+        if "$KSUD" sepolicy apply "$MODDIR/sepolicy.rule" >>"$LOG" 2>&1; then
+            log "sepolicy applied: $(grep -c '^allow' "$MODDIR/sepolicy.rule") rules"
+        else
+            log "sepolicy apply FAILED"
+        fi
+    else
+        log "ksud not found, sepolicy not applied"
+    fi
+fi
 log "post-fs-data done"
