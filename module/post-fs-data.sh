@@ -1,12 +1,37 @@
 #!/system/bin/sh
+# DolbySoundMod - post-fs-data
+#
+# KernelSU v3+ (and any root manager that does not mount module files) leaves the
+# module's vendor/odm tree inert: scripts run, but /vendor/lib64/soundfx and
+# /odm/etc never see the files. The module therefore mounts everything it needs
+# itself - no metamodule, no other module, no root-manager feature.
+#
+# /vendor and /odm are read-only erofs, so a bind mount is the only way in:
+#  * effect libs: a staging dir on /data with every stock lib re-bound into it plus
+#    ours, then the whole dir is bound over /vendor/lib64/soundfx;
+#  * audio_effects_config.xml: our patched copy is bound over the live file;
+#  * model: lives in /data/adb/allysound so no /vendor/etc/allysound is needed.
+# Labels matter: files under /data carry app_data_file, which audioserver may
+# neither execute nor read, so everything we expose is chcon'ed to the label of
+# the stock counterpart (vendor_file / vendor_configs_file).
+
 MODDIR=${0%/*}
 [ -z "$MODDIR" ] || [ "$MODDIR" = "$0" ] && MODDIR="/data/adb/modules/allysound"
+
+DATA_DIR="/data/adb/allysound"
+STAGE="$DATA_DIR/sfx_stage"
+SFX_DIR="/vendor/lib64/soundfx"
+LOG="$DATA_DIR/mount.log"
+
+mkdir -p "$DATA_DIR" 2>/dev/null
+: > "$LOG" 2>/dev/null
+log() { echo "$*" >> "$LOG" 2>/dev/null; }
 
 # Non-destructively patch audio_effects_config.xml so we never break AutoSystemBoost or stock effects.
 patch_xml() {
     SRC="$1"
     DST="$2"
-    [ -f "$SRC" ] || return 0
+    [ -f "$SRC" ] || return 1
     mkdir -p "$(dirname "$DST")"
 
     if grep -q "a117500d-0001-4000-8000-000000000001" "$SRC" 2>/dev/null; then
@@ -26,10 +51,87 @@ patch_xml() {
     { print }
     ' "$SRC" > "$DST"
     chmod 0644 "$DST"
+    return 0
+}
+
+# Keep the module-relative copy (for root managers that do mount modules) and bind
+# the patched file over the live path so it is effective either way.
+apply_config() {
+    SRC="$1"
+    DST="$2"
+    patch_xml "$SRC" "$DST" || return 0
+    chcon u:object_r:vendor_configs_file:s0 "$DST" 2>/dev/null
+    if mount --bind "$DST" "$SRC" 2>>"$LOG"; then
+        log "config mounted: $SRC"
+    else
+        log "config bind FAILED: $SRC"
+    fi
+    return 0
+}
+
+# Stage the soundfx directory: stock libs re-bound, ours added on top.
+stage_soundfx() {
+    LIB="$MODDIR/vendor/lib64/soundfx/liballysoundaidl.so"
+    if [ ! -f "$LIB" ]; then
+        log "no liballysoundaidl.so in module: $LIB"
+        return 1
+    fi
+    rm -rf "$STAGE"
+    mkdir -p "$STAGE" || return 1
+
+    count_src=0
+    for f in "$SFX_DIR"/*; do
+        [ -f "$f" ] || continue
+        b=$(basename "$f")
+        : > "$STAGE/$b" || return 1
+        if ! mount --bind "$f" "$STAGE/$b" 2>>"$LOG"; then
+            log "bind FAILED: $b"
+            return 1
+        fi
+        count_src=$((count_src + 1))
+    done
+
+    cp -f "$LIB" "$STAGE/" || return 1
+    if [ -f "$MODDIR/vendor/lib64/libonnxruntime.so" ]; then
+        cp -f "$MODDIR/vendor/lib64/libonnxruntime.so" "$STAGE/"
+    fi
+    chcon u:object_r:vendor_file:s0 "$STAGE/liballysoundaidl.so" 2>/dev/null
+    if [ -f "$STAGE/libonnxruntime.so" ]; then
+        chcon u:object_r:vendor_file:s0 "$STAGE/libonnxruntime.so" 2>/dev/null
+    fi
+
+    count_dst=$(ls "$STAGE" | wc -l)
+    if [ "$count_dst" -lt "$((count_src + 1))" ]; then
+        log "stage incomplete: $count_dst entries, stock $count_src"
+        return 1
+    fi
+
+    if ! mount --bind "$STAGE" "$SFX_DIR" 2>>"$LOG"; then
+        log "soundfx dir bind FAILED"
+        return 1
+    fi
+    log "soundfx staged: $count_dst entries (stock $count_src)"
+    ls "$SFX_DIR" > "$DATA_DIR/soundfx.txt" 2>/dev/null
+    return 0
+}
+
+# Model for the neural separator: audioserver must be able to read it.
+install_model() {
+    SRC="$MODDIR/vendor/etc/allysound/vocals.onnx"
+    DST="$DATA_DIR/vocals.onnx"
+    [ -f "$SRC" ] || return 0
+    cp -f "$SRC" "$DST" || return 0
+    chmod 0644 "$DST"
+    chcon u:object_r:vendor_configs_file:s0 "$DST" 2>/dev/null
+    log "model: $DST"
 }
 
 if [ -f /odm/etc/audio_effects_config.xml ]; then
-    patch_xml /odm/etc/audio_effects_config.xml "$MODDIR/odm/etc/audio_effects_config.xml"
+    apply_config /odm/etc/audio_effects_config.xml "$MODDIR/odm/etc/audio_effects_config.xml"
 elif [ -f /vendor/etc/audio_effects_config.xml ]; then
-    patch_xml /vendor/etc/audio_effects_config.xml "$MODDIR/vendor/etc/audio_effects_config.xml"
+    apply_config /vendor/etc/audio_effects_config.xml "$MODDIR/vendor/etc/audio_effects_config.xml"
 fi
+
+install_model
+stage_soundfx
+log "post-fs-data done"

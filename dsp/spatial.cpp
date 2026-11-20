@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <unistd.h>
 
 namespace ally {
 
@@ -18,6 +19,18 @@ constexpr float kSurroundTrim = 0.65313055f;       // 10^(-3.7/20)
 constexpr float kStereoTrim = 1.6595869f;          // 10^(+4.4/20)
 constexpr float kSpeakerTrimStereo = 0.7762471f;   // 10^(-2.2/20)
 constexpr float kSpeakerTrimSurround = 0.3981072f; // 10^(-8.0/20)
+
+// The model is installed to /data/adb/allysound by post-fs-data.sh; the /vendor
+// path is the fallback for a root manager that does mount module files.
+const char* vocals_model_path() {
+    static const char* cached = nullptr;
+    if (cached == nullptr) {
+        cached = (access("/data/adb/allysound/vocals.onnx", R_OK) == 0)
+                     ? "/data/adb/allysound/vocals.onnx"
+                     : "/vendor/etc/allysound/vocals.onnx";
+    }
+    return cached;
+}
 constexpr float kGlassesBassGain = 0.2589254f;     // 10^(2.0/20) - 1
 
 struct ProfileParams {
@@ -583,7 +596,7 @@ void Renderer::make_stereo_feeds(bool& has_lfe) {
 
 #ifdef ALLY_ENABLE_NPU
     if (neural_ && profile_ == Profile::Movie &&
-        vocals_.ensure_loaded("/vendor/etc/allysound/vocals.onnx", true)) {
+        vocals_.ensure_loaded(vocals_model_path(), true)) {
         std::array<float, 2 * kHop> dry{};
         std::array<float, 2 * kHop> sep_rest{};
         vocals_.process(&block_[0], dry.data(), sep_rest.data(), tick_);

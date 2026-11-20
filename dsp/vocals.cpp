@@ -170,9 +170,23 @@ bool PipelinedVocals::ensure_loaded(const char* model_path, bool use_npu) {
     if (failed_.load()) return false;
 
     auto* d = new Impl();
-    d->ort_lib = dlopen("libonnxruntime.so", RTLD_NOW | RTLD_LOCAL);
+    // ONNX Runtime is shipped in the module and staged into /vendor/lib64/soundfx
+    // by post-fs-data.sh; the plain name covers an install where it lands in a
+    // regular library directory.
+    static const char* kOrtCandidates[] = {
+        "libonnxruntime.so",
+        "/vendor/lib64/soundfx/libonnxruntime.so",
+        "/vendor/lib64/libonnxruntime.so",
+    };
+    for (const char* cand : kOrtCandidates) {
+        d->ort_lib = dlopen(cand, RTLD_NOW | RTLD_LOCAL);
+        if (d->ort_lib) {
+            VLOGI("onnxruntime loaded: %s", cand);
+            break;
+        }
+        VLOGE("dlopen %s failed: %s", cand, dlerror());
+    }
     if (!d->ort_lib) {
-        VLOGE("dlopen libonnxruntime.so failed: %s", dlerror());
         failed_.store(true);
         delete d;
         return false;

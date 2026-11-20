@@ -181,6 +181,12 @@ async function openAppPicker() {
   renderPickerList('');
 }
 
+function guessProfile(pkg) {
+  if (pkg.includes('youtube') || pkg.includes('vlc') || pkg.includes('mxtech')) return 'movie';
+  if (pkg.includes('spotify') || pkg.includes('music')) return 'music';
+  return 'game';
+}
+
 function renderPickerList(query) {
   const listEl = document.getElementById('modal-apps-list');
   const q = query.trim().toLowerCase();
@@ -191,17 +197,19 @@ function renderPickerList(query) {
   }
   listEl.innerHTML = '';
   for (const pkg of filtered) {
+    const chosen = !!appProfiles[pkg];
     const btn = document.createElement('button');
-    btn.className = 'modal-item';
-    btn.textContent = pkg;
+    btn.className = 'modal-item' + (chosen ? ' active' : '');
+    btn.textContent = chosen ? `${pkg}  •  ${appProfiles[pkg]}` : pkg;
     btn.onclick = async () => {
-      if (!appProfiles[pkg]) {
-        appProfiles[pkg] = pkg.includes('youtube') || pkg.includes('vlc') || pkg.includes('mxtech') ? 'movie'
-          : (pkg.includes('spotify') || pkg.includes('music') ? 'music' : 'game');
-        await saveApps();
-        renderApps();
+      if (appProfiles[pkg]) {
+        delete appProfiles[pkg];
+      } else {
+        appProfiles[pkg] = guessProfile(pkg);
       }
-      document.getElementById('app-modal').classList.add('hidden');
+      await saveApps();
+      renderApps();
+      renderPickerList(document.getElementById('app-search').value);
     };
     listEl.appendChild(btn);
   }
@@ -211,6 +219,10 @@ document.querySelectorAll('#device-selector .seg-btn').forEach(btn => {
   btn.onclick = () => saveDevice(btn.dataset.dev);
 });
 document.getElementById('btn-pick-app').onclick = openAppPicker;
+document.getElementById('btn-done-picker').onclick = () => {
+  document.getElementById('app-modal').classList.add('hidden');
+  renderApps();
+};
 document.getElementById('btn-close-modal').onclick = () => {
   document.getElementById('app-modal').classList.add('hidden');
 };
