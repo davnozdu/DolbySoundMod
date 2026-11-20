@@ -83,11 +83,14 @@ stage_soundfx() {
     for f in "$SFX_DIR"/*; do
         [ -f "$f" ] || continue
         b=$(basename "$f")
-        : > "$STAGE/$b" || return 1
-        if ! mount --bind "$f" "$STAGE/$b" 2>>"$LOG"; then
-            log "bind FAILED: $b"
+        # Copy, do not bind: a file bind here leaves the entry readable as 0 bytes
+        # once the staging dir is bound over $SFX_DIR, and the effect HAL then
+        # refuses every library in the directory.
+        if ! cp -f "$f" "$STAGE/$b" 2>>"$LOG"; then
+            log "copy FAILED: $b"
             return 1
         fi
+        chcon u:object_r:vendor_file:s0 "$STAGE/$b" 2>/dev/null
         count_src=$((count_src + 1))
     done
 
