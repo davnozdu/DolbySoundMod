@@ -2,3 +2,9 @@ allow hal_audio_default ashmem_device chr_file { open read write ioctl map getat
 allow hal_audio_default hal_audio_default file { open read write create getattr setattr map unlink }
 allow hal_audio_default memfd file { open read write getattr setattr map }
 allow hal_audio_default tmpfs file { open read write create getattr setattr map unlink }
+# The effect queues are memfds, and SELinux labels a memfd with the domain that created it
+# (u:r:hal_audio_default) instead of giving it a file type. audioserver maps those queues when
+# it attaches the effect, so it needs access to that label too - without this rule the queue is
+# refused ("handleSetConfig ... Line: 205 Failed" right after open, then "invalid efGroup" on
+# every buffer) and the refusal is silently dropped by a dontaudit, so nothing shows in dmesg.
+allow audioserver hal_audio_default file { read write open map getattr ioctl }
