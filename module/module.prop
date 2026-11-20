@@ -1,0 +1,6 @@
+id=allysound
+name=Ally Sound Lab
+version=v1.0.0
+versionCode=100
+author=davnozdu
+description=Per-app virtual 7.1 & HRTF spatial audio (Game / Movie / Music) with KernelSU WebUI. Zero external dependencies.

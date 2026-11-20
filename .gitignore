@@ -1,0 +1,9 @@
+dsp/hrir_ku100.hpp
+test_dsp
+build_arm64/
+build_java/
+aidl_src/
+aidl_gen/
+stubs/
+dist/
+*.zip

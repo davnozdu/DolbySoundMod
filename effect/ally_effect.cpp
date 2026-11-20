@@ -1,0 +1,376 @@
+#include "fmq_helper.hpp"
+#include "../dsp/spatial.hpp"
+
+#include <aidl/android/hardware/audio/effect/BnEffect.h>
+#include <aidl/android/hardware/audio/effect/Descriptor.h>
+#include <aidl/android/hardware/audio/effect/IEffect.h>
+#include <aidl/android/media/audio/common/AudioChannelLayout.h>
+#include <aidl/android/media/audio/common/AudioUuid.h>
+#include <android/log.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+#define LOG_TAG "AllySoundAidl"
+#define ALOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define ALOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+namespace aidl::android::hardware::audio::effect {
+
+namespace {
+
+using aidl::android::media::audio::common::AudioChannelLayout;
+using aidl::android::media::audio::common::AudioUuid;
+
+// Implementation UUID: a117500d-0001-4000-8000-000000000001
+constexpr AudioUuid kImplUuid = {
+    static_cast<int32_t>(0xa117500d),
+    0x0001,
+    0x4000,
+    static_cast<int16_t>(0x8000),
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
+};
+
+// Type UUID: LoudnessEnhancer (fe3199be-aed0-413f-87bb-11260eb63cf1)
+// Universally accepted by AudioFlinger on any MIXER session.
+constexpr AudioUuid kTypeUuid = {
+    static_cast<int32_t>(0xfe3199be),
+    static_cast<int16_t>(0xaed0),
+    0x413f,
+    static_cast<int16_t>(0x87bb),
+    {0x11, 0x26, 0x0e, 0xb6, 0x3c, 0xf1},
+};
+
+int channel_count_from_layout(const AudioChannelLayout& layout) {
+    if (layout.getTag() == AudioChannelLayout::layoutMask) {
+        int32_t mask = layout.get<AudioChannelLayout::layoutMask>();
+        return __builtin_popcount(static_cast<uint32_t>(mask));
+    }
+    if (layout.getTag() == AudioChannelLayout::indexMask) {
+        int32_t mask = layout.get<AudioChannelLayout::indexMask>();
+        return __builtin_popcount(static_cast<uint32_t>(mask));
+    }
+    return 2;
+}
+
+Descriptor make_descriptor() {
+    Descriptor desc;
+    desc.common.id.type = kTypeUuid;
+    desc.common.id.uuid = kImplUuid;
+    desc.common.name = "Ally Sound Lab";
+    desc.common.implementor = "AllySoundKSU";
+    desc.common.flags.type = Flags::Type::INSERT;
+    desc.common.flags.insert = Flags::Insert::FIRST;
+    desc.common.flags.volume = Flags::Volume::NONE;
+    desc.common.flags.hwAcceleratorMode = Flags::HardwareAccelerator::NONE;
+    desc.common.flags.bypass = false;
+    desc.common.flags.deviceIndication = true;
+    return desc;
+}
+
+class AllySoundEffect final : public BnEffect {
+public:
+    AllySoundEffect() = default;
+    ~AllySoundEffect() override {
+        stop_worker();
+    }
+
+    ndk::ScopedAStatus open(const Parameter::Common& common,
+                            const std::optional<Parameter::Specific>& specific,
+                            OpenEffectReturn* _aidl_return) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stop_worker_locked();
+
+        common_ = common;
+        sample_rate_ = static_cast<float>(common.input.base.sampleRate > 0 ? common.input.base.sampleRate : 48000);
+        in_channels_ = std::max(1, channel_count_from_layout(common.input.base.channelMask));
+        out_channels_ = std::max(1, channel_count_from_layout(common.output.base.channelMask));
+        frame_count_ = static_cast<size_t>(std::max<int64_t>(common.input.frameCount, 256));
+
+        renderer_.init(sample_rate_);
+        renderer_.set_profile(profile_.load());
+        renderer_.set_device(device_.load());
+
+        if (specific.has_value()) {
+            apply_specific_locked(*specific);
+        }
+
+        const size_t in_samples = std::max<size_t>(frame_count_ * in_channels_ * 4, 4096);
+        const size_t out_samples = std::max<size_t>(frame_count_ * out_channels_ * 4, 4096);
+        if (!status_mq_.init(128) || !in_mq_.init(in_samples) || !out_mq_.init(out_samples)) {
+            ALOGE("Failed to initialize FMQ queues");
+            return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_STATE);
+        }
+
+        _aidl_return->statusMQ = status_mq_.dup_descriptor();
+        _aidl_return->inputDataMQ = in_mq_.dup_descriptor();
+        _aidl_return->outputDataMQ = out_mq_.dup_descriptor();
+
+        state_.store(State::IDLE);
+        start_worker_locked();
+        ALOGI("Opened effect: sr=%.0f in_ch=%d out_ch=%d frames=%zu",
+              sample_rate_, in_channels_, out_channels_, frame_count_);
+        return ndk::ScopedAStatus::ok();
+    }
+
+    ndk::ScopedAStatus close() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stop_worker_locked();
+        status_mq_.reset();
+        in_mq_.reset();
+        out_mq_.reset();
+        state_.store(State::INIT);
+        return ndk::ScopedAStatus::ok();
+    }
+
+    ndk::ScopedAStatus getDescriptor(Descriptor* _aidl_return) override {
+        *_aidl_return = make_descriptor();
+        return ndk::ScopedAStatus::ok();
+    }
+
+    ndk::ScopedAStatus command(CommandId commandId) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        switch (commandId) {
+            case CommandId::START:
+                if (state_.load() == State::IDLE) {
+                    state_.store(State::PROCESSING);
+                }
+                break;
+            case CommandId::STOP:
+                if (state_.load() == State::PROCESSING) {
+                    state_.store(State::IDLE);
+                }
+                break;
+            case CommandId::RESET:
+                renderer_.reset();
+                break;
+            default:
+                break;
+        }
+        return ndk::ScopedAStatus::ok();
+    }
+
+    ndk::ScopedAStatus getState(State* _aidl_return) override {
+        *_aidl_return = state_.load();
+        return ndk::ScopedAStatus::ok();
+    }
+
+    ndk::ScopedAStatus setParameter(const Parameter& param) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (param.getTag() == Parameter::common) {
+            common_ = param.get<Parameter::common>();
+            return ndk::ScopedAStatus::ok();
+        }
+        if (param.getTag() == Parameter::specific) {
+            apply_specific_locked(param.get<Parameter::specific>());
+            return ndk::ScopedAStatus::ok();
+        }
+        return ndk::ScopedAStatus::ok();
+    }
+
+    ndk::ScopedAStatus getParameter(const Parameter::Id& paramId, Parameter* _aidl_return) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (paramId.getTag() == Parameter::Id::commonTag) {
+            _aidl_return->set<Parameter::common>(common_);
+            return ndk::ScopedAStatus::ok();
+        }
+        if (paramId.getTag() == Parameter::Id::loudnessEnhancerTag) {
+            LoudnessEnhancer le;
+            le.gainMb = encoded_gain_mb();
+            Parameter::Specific spec;
+            spec.set<Parameter::Specific::loudnessEnhancer>(le);
+            _aidl_return->set<Parameter::specific>(spec);
+            return ndk::ScopedAStatus::ok();
+        }
+        return ndk::ScopedAStatus::fromExceptionCode(EX_UNSUPPORTED_OPERATION);
+    }
+
+    ndk::ScopedAStatus reopen(OpenEffectReturn* _aidl_return) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_.load() == State::INIT) {
+            return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_STATE);
+        }
+        _aidl_return->statusMQ = status_mq_.dup_descriptor();
+        _aidl_return->inputDataMQ = in_mq_.dup_descriptor();
+        _aidl_return->outputDataMQ = out_mq_.dup_descriptor();
+        return ndk::ScopedAStatus::ok();
+    }
+
+private:
+    std::mutex mutex_;
+    std::atomic<State> state_{State::INIT};
+    std::atomic<ally::Profile> profile_{ally::Profile::Game};
+    std::atomic<ally::DeviceKind> device_{ally::DeviceKind::Headphones};
+    std::atomic<bool> worker_running_{false};
+    std::thread worker_;
+
+    Parameter::Common common_{};
+    float sample_rate_ = 48000.0f;
+    int in_channels_ = 2;
+    int out_channels_ = 2;
+    size_t frame_count_ = 256;
+
+    ally::Renderer renderer_;
+    ally::FmqQueue<IEffect::Status> status_mq_;
+    ally::FmqQueue<float> in_mq_;
+    ally::FmqQueue<float> out_mq_;
+
+    int32_t encoded_gain_mb() const {
+        return 10000 + static_cast<int>(profile_.load()) * 10 + static_cast<int>(device_.load());
+    }
+
+    void apply_specific_locked(const Parameter::Specific& spec) {
+        if (spec.getTag() == Parameter::Specific::loudnessEnhancer) {
+            int32_t val = spec.get<Parameter::Specific::loudnessEnhancer>().gainMb;
+            if (val >= 10000 && val < 10100) {
+                int p = (val - 10000) / 10;
+                int d = (val - 10000) % 10;
+                if (p >= 0 && p <= 3) {
+                    auto prof = static_cast<ally::Profile>(p);
+                    profile_.store(prof);
+                    renderer_.set_profile(prof);
+                }
+                if (d >= 0 && d <= 2) {
+                    auto dev = static_cast<ally::DeviceKind>(d);
+                    device_.store(dev);
+                    renderer_.set_device(dev);
+                }
+                ALOGI("Updated params: profile=%d device=%d", p, d);
+            }
+        }
+    }
+
+    void start_worker_locked() {
+        worker_running_.store(true);
+        worker_ = std::thread([this]() { worker_loop(); });
+    }
+
+    void stop_worker() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stop_worker_locked();
+    }
+
+    void stop_worker_locked() {
+        if (worker_running_.exchange(false)) {
+            in_mq_.wake(1);
+            if (worker_.joinable()) {
+                worker_.join();
+            }
+        }
+    }
+
+    void worker_loop() {
+        std::vector<float> in_buf;
+        std::vector<float> stereo_buf;
+        std::vector<float> out_buf;
+
+        while (worker_running_.load()) {
+            in_mq_.wait(1, 20);
+            if (!worker_running_.load()) break;
+
+            size_t avail_in = in_mq_.available_to_read();
+            if (avail_in < static_cast<size_t>(in_channels_)) {
+                continue;
+            }
+            size_t frames = avail_in / static_cast<size_t>(in_channels_);
+            size_t avail_out_frames = out_mq_.available_to_write() / static_cast<size_t>(out_channels_);
+            frames = std::min(frames, avail_out_frames);
+            if (frames == 0) continue;
+
+            in_buf.resize(frames * in_channels_);
+            stereo_buf.resize(frames * 2);
+            out_buf.resize(frames * out_channels_);
+
+            if (!in_mq_.read(in_buf.data(), frames * in_channels_)) {
+                continue;
+            }
+
+            if (state_.load() == State::PROCESSING) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (in_channels_ == 1) {
+                    // Mono -> duplicate to stereo for renderer
+                    std::vector<float> st_in(frames * 2);
+                    for (size_t i = 0; i < frames; ++i) {
+                        st_in[2 * i] = in_buf[i];
+                        st_in[2 * i + 1] = in_buf[i];
+                    }
+                    renderer_.process_interleaved(st_in.data(), stereo_buf.data(), static_cast<int>(frames), 2);
+                } else {
+                    renderer_.process_interleaved(in_buf.data(), stereo_buf.data(), static_cast<int>(frames), in_channels_);
+                }
+            } else {
+                // Idle / bypass
+                for (size_t i = 0; i < frames; ++i) {
+                    stereo_buf[2 * i + 0] = in_buf[i * in_channels_ + 0];
+                    stereo_buf[2 * i + 1] = (in_channels_ > 1) ? in_buf[i * in_channels_ + 1] : in_buf[i * in_channels_ + 0];
+                }
+            }
+
+            if (out_channels_ == 2) {
+                out_mq_.write(stereo_buf.data(), frames * 2);
+            } else {
+                std::fill(out_buf.begin(), out_buf.end(), 0.0f);
+                for (size_t i = 0; i < frames; ++i) {
+                    out_buf[i * out_channels_ + 0] = stereo_buf[2 * i + 0];
+                    if (out_channels_ > 1) out_buf[i * out_channels_ + 1] = stereo_buf[2 * i + 1];
+                }
+                out_mq_.write(out_buf.data(), frames * out_channels_);
+            }
+
+            IEffect::Status st{};
+            st.status = 0; // STATUS_OK
+            st.fmqConsumed = static_cast<int32_t>(frames * in_channels_);
+            st.fmqProduced = static_cast<int32_t>(frames * out_channels_);
+            status_mq_.write(&st, 1);
+            status_mq_.wake(1);
+        }
+    }
+};
+
+std::mutex g_instances_mutex;
+std::vector<std::shared_ptr<AllySoundEffect>> g_instances;
+
+} // namespace
+} // namespace aidl::android::hardware::audio::effect
+
+extern "C" binder_status_t queryEffect(
+    const aidl::android::media::audio::common::AudioUuid* in_impl_uuid,
+    aidl::android::hardware::audio::effect::Descriptor* _aidl_return) {
+    if (!in_impl_uuid || !_aidl_return) return STATUS_BAD_VALUE;
+    if (*in_impl_uuid != aidl::android::hardware::audio::effect::kImplUuid) {
+        return STATUS_NAME_NOT_FOUND;
+    }
+    *_aidl_return = aidl::android::hardware::audio::effect::make_descriptor();
+    return STATUS_OK;
+}
+
+extern "C" binder_status_t createEffect(
+    const aidl::android::media::audio::common::AudioUuid* in_impl_uuid,
+    std::shared_ptr<aidl::android::hardware::audio::effect::IEffect>* _aidl_return) {
+    if (!in_impl_uuid || !_aidl_return) return STATUS_BAD_VALUE;
+    if (*in_impl_uuid != aidl::android::hardware::audio::effect::kImplUuid) {
+        return STATUS_NAME_NOT_FOUND;
+    }
+    auto inst = ndk::SharedRefBase::make<aidl::android::hardware::audio::effect::AllySoundEffect>();
+    {
+        std::lock_guard<std::mutex> lock(aidl::android::hardware::audio::effect::g_instances_mutex);
+        aidl::android::hardware::audio::effect::g_instances.push_back(inst);
+    }
+    *_aidl_return = inst;
+    return STATUS_OK;
+}
+
+extern "C" binder_status_t destroyEffect(
+    const std::shared_ptr<aidl::android::hardware::audio::effect::IEffect>& in_instance) {
+    if (!in_instance) return STATUS_BAD_VALUE;
+    in_instance->close();
+    std::lock_guard<std::mutex> lock(aidl::android::hardware::audio::effect::g_instances_mutex);
+    auto& vec = aidl::android::hardware::audio::effect::g_instances;
+    vec.erase(std::remove(vec.begin(), vec.end(), in_instance), vec.end());
+    return STATUS_OK;
+}

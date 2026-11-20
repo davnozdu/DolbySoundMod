@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>Ally Sound Lab</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <div>
+        <h1>Ally Sound Lab</h1>
+        <p class="subtitle">HRTF 7.1 &amp; Spatial Audio</p>
+      </div>
+      <span id="status-badge" class="badge badge-idle">Загрузка...</span>
+    </header>
+
+    <section class="card">
+      <div class="card-title">Устройство вывода</div>
+      <div class="segmented" id="device-selector">
+        <button data-dev="auto" class="seg-btn active">Авто</button>
+        <button data-dev="headphones" class="seg-btn">Наушники</button>
+        <button data-dev="speakers" class="seg-btn">Динамики</button>
+        <button data-dev="glasses" class="seg-btn">Очки</button>
+      </div>
+      <div id="active-sessions" class="sessions-info">Нет активных сессий</div>
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <div class="card-title">Приложения</div>
+        <button id="btn-pick-app" class="btn-primary">+ Выбрать приложение</button>
+      </div>
+      <div id="apps-list" class="apps-list">
+        <div class="empty-state">Нажмите «Выбрать приложение», например YouTube, чтобы задать профиль звука.</div>
+      </div>
+    </section>
+  </div>
+
+  <div id="app-modal" class="modal hidden">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2>Выбрать приложение</h2>
+        <button id="btn-close-modal" class="btn-icon">&times;</button>
+      </div>
+      <input id="app-search" type="search" class="search-input" placeholder="Поиск (youtube, vlc, spotify...)" />
+      <div id="modal-apps-list" class="modal-list">
+        <div class="empty-state">Загрузка списка приложений...</div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
