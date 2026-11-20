@@ -201,7 +201,9 @@ public:
         if (access("/data/adb/allysound/borrow_status", F_OK) == 0) {
             IEffect::OpenEffectReturn vendor{};
             if (borrow_vendor_status(common, &vendor)) {
-                _aidl_return->statusMQ = vendor.statusMQ;
+                // Move, not copy: NativeHandle holds ScopedFileDescriptor, which is movable
+                // but not copyable.
+                _aidl_return->statusMQ = std::move(vendor.statusMQ);
                 ALOGI("borrow_status: returning the vendor status queue to the client");
             }
         }
