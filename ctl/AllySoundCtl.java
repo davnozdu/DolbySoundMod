@@ -178,7 +178,14 @@ public class AllySoundCtl {
                         try {
                             int sid = Integer.parseInt(parts[0]);
                             String pkg = parts[4];
-                            sessions.put(sid, pkg);
+                            // One session can list several clients: our own AudioEffect shows up
+                            // as "root" next to the app. Take the last real package name, never
+                            // let a bare process name overwrite it, or the controller releases
+                            // the effect it has just created and starts over every cycle.
+                            String prev = sessions.get(sid);
+                            if (prev == null || (!prev.contains(".") && pkg.contains("."))) {
+                                sessions.put(sid, pkg);
+                            }
                         } catch (NumberFormatException ignored) {}
                     }
                 }
