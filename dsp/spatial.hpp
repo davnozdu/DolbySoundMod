@@ -1,7 +1,9 @@
 #pragma once
 
 #include "fft.hpp"
+#ifdef ALLY_ENABLE_NPU
 #include "vocals.hpp"
+#endif
 #include <array>
 #include <complex>
 #include <cstdint>
@@ -160,7 +162,9 @@ private:
     bool neural_ = false;
     uint64_t tick_ = 0;
 
+#ifdef ALLY_ENABLE_NPU
     PipelinedVocals vocals_;
+#endif
     BiquadFilter cinema_air_;
 
     Convolver direct_;
