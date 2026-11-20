@@ -333,6 +333,14 @@ private:
             // Process exactly one buffer per status message: that is what the HAL
             // wrote, and a short or oversized reply makes it wait for the missing
             // frames, which is audible as a hiccup.
+            static auto last_beat = std::chrono::steady_clock::now();
+            auto now_beat = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now_beat - last_beat).count() >= 2000) {
+                ALOGI("effect beat: avail_in=%d avail_out=%d frame_count=%zu state=%d",
+                      (int)in_mq_.available_to_read(), (int)out_mq_.available_to_write(),
+                      frame_count_, (int)state_.load());
+                last_beat = now_beat;
+            }
             const size_t want_frames = frame_count_ > 0 ? frame_count_ : 1024;
             const size_t need_in = want_frames * static_cast<size_t>(in_channels_);
             const size_t need_out = want_frames * static_cast<size_t>(out_channels_);
