@@ -79,15 +79,6 @@ static bool is_known_uuid(const AudioUuid& u) {
     return u == kImplUuid || u == kOplusUuid;
 }
 
-// The vendor slot uuid (the one the Oplus policy config refers to). Our library is
-// installed there too, so the stock DSP library is not loaded at all, but the effect
-// itself deliberately declines that uuid: the policy attaches it to the global output
-// mix without ever opening it, and an unopened instance only floods the log with
-// 'invalid efGroup' for every buffer while processing nothing.
-static bool is_vendor_slot_uuid(const AudioUuid& u) {
-    return u == kOplusUuid;
-}
-
 Descriptor make_descriptor(const AudioUuid& impl) {
     Descriptor desc;
     // The Oplus slot reports itself exactly like the vendor library does: its own uuid is
@@ -474,9 +465,6 @@ extern "C" binder_status_t queryEffect(
     aidl::android::hardware::audio::effect::Descriptor* _aidl_return) {
     if (!in_impl_uuid || !_aidl_return) return STATUS_BAD_VALUE;
     if (!aidl::android::hardware::audio::effect::is_known_uuid(*in_impl_uuid)) return STATUS_NAME_NOT_FOUND;
-    // The vendor slot uuid stays visible here on purpose: the HAL loads this library
-    // through that slot, so declining the descriptor would hide our own uuid too.
-    // Only createEffect refuses it (it must never run a second, never-opened instance).
     *_aidl_return = aidl::android::hardware::audio::effect::make_descriptor(*in_impl_uuid);
     return STATUS_OK;
 }
@@ -486,14 +474,6 @@ extern "C" binder_status_t createEffect(
     std::shared_ptr<aidl::android::hardware::audio::effect::IEffect>* _aidl_return) {
     if (!in_impl_uuid || !_aidl_return) return STATUS_BAD_VALUE;
     if (!aidl::android::hardware::audio::effect::is_known_uuid(*in_impl_uuid)) return STATUS_NAME_NOT_FOUND;
-    if (aidl::android::hardware::audio::effect::is_vendor_slot_uuid(*in_impl_uuid)) {
-        // We are also installed in the vendor Oplus slot so the stock DSP library is
-        // gone, but the effect itself must only run through our own uuid: the vendor
-        // policy attaches that slot to the global output mix without ever opening it,
-        // so a live instance there would just log 'invalid efGroup' for every buffer.
-        ALOGI("declining vendor slot uuid: the effect runs under its own uuid");
-        return STATUS_NAME_NOT_FOUND;
-    }
     auto inst = ndk::SharedRefBase::make<aidl::android::hardware::audio::effect::AllySoundEffect>(*in_impl_uuid);
     {
         std::lock_guard<std::mutex> lock(aidl::android::hardware::audio::effect::g_instances_mutex);
