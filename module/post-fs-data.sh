@@ -132,6 +132,36 @@ elif [ -f /vendor/etc/audio_effects_config.xml ]; then
     apply_config /vendor/etc/audio_effects_config.xml "$MODDIR/vendor/etc/audio_effects_config.xml"
 fi
 
+# The QTI effect HAL resolves <library path=...> entries from the sku
+# audio_effects.xml (that is where bundle/reverb/... are declared), so a library
+# listed only in audio_effects_config.xml is reported as "can't find
+# liballysoundaidl.so" and our effect never reaches the HAL's UUID list.
+patch_sku_effects() {
+    for SKU in /vendor/etc/audio/sku_*/*audio_effects.xml /odm/etc/audio/sku_*/*audio_effects.xml; do
+        [ -f "$SKU" ] || continue
+        case "$SKU" in *audio_effects_config.xml) continue;; esac
+        grep -q '<libraries>' "$SKU" || continue
+        OUT="$DATA_DIR/sku_$(echo "$SKU" | tr '/' '_')"
+        cp -f "$SKU" "$OUT" 2>/dev/null || continue
+        grep -q 'name="allysound"' "$OUT" && continue
+        awk '
+        /<\/libraries>/ && !done {
+            print "        <library name=\"allysound\" path=\"liballysoundaidl.so\"/>"
+            done=1
+        }
+        { print }
+        ' "$OUT" > "$OUT.new" && mv -f "$OUT.new" "$OUT"
+        chmod 0644 "$OUT"
+        chcon u:object_r:vendor_configs_file:s0 "$OUT" 2>/dev/null
+        if mount --bind "$OUT" "$SKU" 2>>"$LOG"; then
+            log "sku config patched: $SKU"
+        else
+            log "sku config bind FAILED: $SKU"
+        fi
+    done
+}
+
 install_model
 stage_soundfx
+patch_sku_effects
 log "post-fs-data done"
