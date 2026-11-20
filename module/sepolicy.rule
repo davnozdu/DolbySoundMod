@@ -1,0 +1,9 @@
+# hal_audio_default runs our effect library inside the vendor audio HAL. The stock
+# effect libraries get their shared memory from libfmq, which this domain is allowed
+# to do, but a plain memfd created by the library itself is silently denied
+# (dontaudit), so open() fails with EACCES on ftruncate/pwrite and /dev/ashmem.
+# Grant exactly the shared-memory paths the effect needs.
+allow hal_audio_default hal_audio_default:file { open read write create getattr setattr map unlink };
+allow hal_audio_default memfd:file { open read write getattr setattr map };
+allow hal_audio_default tmpfs:file { open read write create getattr setattr map unlink };
+allow hal_audio_default ashmem_device:chr_file { open read write ioctl map getattr };

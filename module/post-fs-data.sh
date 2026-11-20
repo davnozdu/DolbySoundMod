@@ -213,4 +213,5 @@ install_model
 stage_soundfx
 stage_odm_soundfx
 patch_sku_effects
+[ -f "$MODDIR/sepolicy.rule" ] && log "sepolicy.rule shipped ($(grep -c '^allow' "$MODDIR/sepolicy.rule") rules)"
 log "post-fs-data done"
