@@ -183,6 +183,16 @@ public class AllySoundCtl {
         }
     }
 
+    private static void writeDebug(StringBuilder log, Map<Integer, String> sessions) {
+        if (log == null) return;
+        try {
+            log.append("sessions=").append(sessions).append('\n');
+            java.io.FileOutputStream out = new java.io.FileOutputStream(BASE_DIR + "/ctl_debug.txt");
+            out.write(log.toString().getBytes("UTF-8"));
+            out.close();
+        } catch (Exception ignored) {}
+    }
+
     /**
      * Sessions AudioFlinger is currently mixing audio for.
      *
@@ -194,12 +204,14 @@ public class AllySoundCtl {
      */
     private static Map<Integer, String> readActiveSessions() {
         Map<Integer, String> sessions = new HashMap<>();
+        StringBuilder log = new java.io.File(BASE_DIR + "/debug").exists() ? new StringBuilder() : null;
         try {
             Process p = Runtime.getRuntime().exec(new String[]{"dumpsys", "audio"});
             BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()));
             String line;
             while ((line = br.readLine()) != null) {
                 if (!line.contains("state:started")) continue;
+                if (log != null) log.append("hit: ").append(line).append('\n');
                 int sid = intAfter(line, "sessionId:");
                 // "u/pid:10206/6523" is uid/pid; the pid is what /proc knows about.
                 int upid = line.indexOf("u/pid:");
@@ -219,13 +231,20 @@ public class AllySoundCtl {
                 }
                 if (sid <= 0 || pid <= 0) continue;
                 String pkg = packageOfPid(pid);
+                if (log != null) log.append("parsed sid=").append(sid).append(" pid=").append(pid)
+                        .append(" pkg=").append(pkg).append('\n');
                 if (pkg != null && pkg.contains(".") && !sessions.containsKey(sid)) {
                     sessions.put(sid, pkg);
                 }
             }
             p.destroy();
-        } catch (Exception ignored) {}
-        if (!sessions.isEmpty()) return sessions;
+        } catch (Exception e) {
+            if (log != null) log.append("audio dump failed: ").append(e).append('\n');
+        }
+        if (!sessions.isEmpty()) {
+            writeDebug(log, sessions);
+            return sessions;
+        }
 
         try {
             Process p = Runtime.getRuntime().exec(new String[]{"dumpsys", "media.audio_flinger"});
@@ -263,7 +282,10 @@ public class AllySoundCtl {
             }
             p.destroy();  // an early break leaves dumpsys blocked on a full pipe;
                           // waitFor() would then hang the whole control loop
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            if (log != null) log.append("flinger dump failed: ").append(e).append('\n');
+        }
+        writeDebug(log, sessions);
         return sessions;
     }
 
