@@ -3,7 +3,11 @@
 #include <aidl/android/hardware/common/fmq/MQDescriptor.h>
 #include <aidl/android/hardware/common/fmq/SynchronizedReadWrite.h>
 #include <android/binder_ibinder.h>
-#include <android/sharedmem.h>
+#include <sys/ioctl.h>
+
+// Weak on purpose: linking libandroid.so directly makes the whole effect library
+// unloadable in a vendor process (its namespace does not expose system-only libs).
+extern "C" int ASharedMemory_create(const char* name, size_t size) __attribute__((weak));
 #include <android/log.h>
 
 #ifndef ALOGE
@@ -11,6 +15,9 @@
 #endif
 #ifndef ALOGW
 #define ALOGW(...) __android_log_print(ANDROID_LOG_WARN, "AllySoundAidl", __VA_ARGS__)
+#endif
+#ifndef ALOGD
+#define ALOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "AllySoundAidl", __VA_ARGS__)
 #endif
 #include <fcntl.h>
 #include <linux/futex.h>
@@ -41,6 +48,24 @@ public:
 
     FmqQueue(const FmqQueue&) = delete;
     FmqQueue& operator=(const FmqQueue&) = delete;
+
+    // Legacy but universally allowed path for vendor processes: /dev/ashmem.
+    static int open_ashmem(const char* name, size_t bytes) {
+        int fd = open("/dev/ashmem", O_RDWR | O_CLOEXEC);
+        if (fd < 0) {
+            ALOGW("fmq: open /dev/ashmem: %s", strerror(errno));
+            return -1;
+        }
+        if (ioctl(fd, _IOW('a', 0x21, char*), name) != 0) {
+            ALOGW("fmq: ashmem set name: %s", strerror(errno));
+        }
+        if (ioctl(fd, _IOW('a', 0x20, size_t), bytes) != 0) {
+            ALOGW("fmq: ashmem set size: %s", strerror(errno));
+            close(fd);
+            return -1;
+        }
+        return fd;
+    }
 
     // A vendor HAL domain may refuse ftruncate on a memfd while still allowing other
     // ways to give it a size, so try the alternatives before giving up.
@@ -77,10 +102,18 @@ public:
         // effect libraries in this very process, so whatever the HAL domain allows for
         // them it allows here (a bare memfd + ftruncate hits EACCES in that domain).
         bool sized = false;
-        fd_ = ASharedMemory_create("ally_fmq", total_bytes_);
-        if (fd_ >= 0) {
-            sized = true;
-        } else {
+        if (ASharedMemory_create != nullptr) {
+            fd_ = ASharedMemory_create("ally_fmq", total_bytes_);
+            if (fd_ >= 0) sized = true;
+        }
+        if (!sized) {
+            fd_ = open_ashmem("ally_fmq", total_bytes_);
+            if (fd_ >= 0) {
+                sized = true;
+                ALOGD("fmq: queue from /dev/ashmem (%zu bytes)", total_bytes_);
+            }
+        }
+        if (!sized) {
             ALOGW("fmq: ASharedMemory_create failed: %s, falling back to memfd",
                   strerror(errno));
             fd_ = static_cast<int>(syscall(__NR_memfd_create, "ally_fmq", 1 /* MFD_CLOEXEC */));
