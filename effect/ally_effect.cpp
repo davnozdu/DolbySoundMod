@@ -402,10 +402,10 @@ private:
         stop_worker_locked();
     }
 
-    // AOSP AIDL EffectHalAidl (V2+) wakes bit 2 (0x04) on statusMQ's event flag when
-    // inputDataMQ has new samples, keeping it distinct from FMQ_NOT_EMPTY (0x02) that
-    // statusMQ->readBlocking() waits on.
-    static constexpr uint32_t kEventFlagDataMqNotEmpty = 1u << 2;
+    // Wake mask for incoming audio on statusMQ's event flag: covers V1 (bit 0 = 0x01)
+    // and V2/V3 (bits 2..4) while excluding FMQ_NOT_EMPTY (bit 1 = 0x02) that we wake
+    // ourselves for statusMQ->readBlocking().
+    static constexpr uint32_t kEventFlagDataMqNotEmpty = (1u << 0) | (1u << 2) | (1u << 3) | (1u << 4);
 
     void stop_worker_locked() {
         if (worker_running_.exchange(false)) {

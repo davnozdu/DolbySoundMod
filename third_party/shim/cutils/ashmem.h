@@ -12,6 +12,7 @@
 // Note: the ashmem ioctls are issued only when the device node exists; anything else goes
 // straight to the memfd path so a missing or restricted node cannot break effect creation.
 
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <linux/memfd.h>
 #include <stdio.h>
@@ -33,6 +34,23 @@
 #endif
 
 static inline int ashmem_create_region(const char* name, size_t size) {
+    // Prefer the host audio HAL process's own libcutils ashmem_create_region (via ashmemd /
+    // vendor ashmem): it returns an fd with the exact SELinux label audioserver already allows.
+    using AshmemCreateFn = int (*)(const char*, size_t);
+    static AshmemCreateFn real_fn = []() -> AshmemCreateFn {
+        void* sym = dlsym(RTLD_DEFAULT, "ashmem_create_region");
+        if (!sym) {
+            void* lib = dlopen("libcutils.so", RTLD_LAZY | RTLD_NOLOAD);
+            if (!lib) lib = dlopen("/system/lib64/libcutils.so", RTLD_LAZY);
+            if (lib) sym = dlsym(lib, "ashmem_create_region");
+        }
+        return reinterpret_cast<AshmemCreateFn>(sym);
+    }();
+    if (real_fn) {
+        int fd = real_fn((name && *name) ? name : "MessageQueue", size);
+        if (fd >= 0) return fd;
+    }
+
     int fd = ::open("/dev/ashmem", O_RDWR | O_CLOEXEC);
     if (fd >= 0) {
         char region[ASHMEM_NAME_LEN] = {};
