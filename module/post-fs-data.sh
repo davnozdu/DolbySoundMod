@@ -108,6 +108,11 @@ stage_soundfx() {
     if [ -f "$MODDIR/vendor/lib64/libonnxruntime.so" ]; then
         cp -f "$MODDIR/vendor/lib64/libonnxruntime.so" "$STAGE/"
     fi
+    if [ -f "$MODDIR/vendor/etc/allysound/vocals.onnx" ]; then
+        cp -f "$MODDIR/vendor/etc/allysound/vocals.onnx" "$STAGE/vocals.onnx"
+        chmod 0644 "$STAGE/vocals.onnx"
+        chcon u:object_r:vendor_file:s0 "$STAGE/vocals.onnx" 2>/dev/null
+    fi
     chcon u:object_r:vendor_file:s0 "$STAGE/liballysoundaidl.so" 2>/dev/null
     if [ -f "$STAGE/libonnxruntime.so" ]; then
         chcon u:object_r:vendor_file:s0 "$STAGE/libonnxruntime.so" 2>/dev/null

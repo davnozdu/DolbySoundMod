@@ -21,14 +21,19 @@ constexpr float kSpeakerTrimStereo = 0.7762471f;   // 10^(-2.2/20)
 constexpr float kSpeakerTrimSurround = 0.3981072f; // 10^(-8.0/20)
 
 #ifdef ALLY_ENABLE_NPU
-// The model is installed to /data/adb/allysound by post-fs-data.sh; the /vendor
-// path is the fallback for a root manager that does mount module files.
+// /data/adb is 0700 root:root so audiohalservice (uid=audioserver) cannot traverse it.
+// post-fs-data.sh stages vocals.onnx into the already bind-mounted /vendor/lib64/soundfx
+// directory alongside liballysoundaidl.so and libonnxruntime.so.
 const char* vocals_model_path() {
     static const char* cached = nullptr;
     if (cached == nullptr) {
-        cached = (access("/data/adb/allysound/vocals.onnx", R_OK) == 0)
-                     ? "/data/adb/allysound/vocals.onnx"
-                     : "/vendor/etc/allysound/vocals.onnx";
+        if (access("/vendor/lib64/soundfx/vocals.onnx", R_OK) == 0) {
+            cached = "/vendor/lib64/soundfx/vocals.onnx";
+        } else if (access("/vendor/etc/allysound/vocals.onnx", R_OK) == 0) {
+            cached = "/vendor/etc/allysound/vocals.onnx";
+        } else {
+            cached = "/data/adb/allysound/vocals.onnx";
+        }
     }
     return cached;
 }
