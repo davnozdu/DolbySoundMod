@@ -12,24 +12,60 @@ let deviceMode = 'auto';
 let installedPkgs = [];
 
 function execCmd(cmd) {
+  const api = (typeof ksu !== 'undefined' && typeof ksu.exec === 'function') ? ksu
+            : (typeof ksud !== 'undefined' && typeof ksud.exec === 'function') ? ksud
+            : null;
+  if (!api) return Promise.resolve('');
   return new Promise((resolve, reject) => {
-    if (typeof ksu !== 'undefined' && typeof ksu.exec === 'function') {
-      const cb = `cb_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-      window[cb] = (errno, stdout, stderr) => {
-        delete window[cb];
-        if (errno === 0) resolve(stdout || '');
-        else reject(new Error(stderr || `exit ${errno}`));
-      };
-      ksu.exec(cmd, '{}', cb);
-    } else {
-      resolve('');
+    let done = false;
+    const finish = (errno, stdout, stderr) => {
+      if (done) return;
+      done = true;
+      if (errno === 0 || errno === undefined) resolve(stdout || '');
+      else reject(new Error(stderr || `exit ${errno}`));
+    };
+    let ret;
+    try { ret = api.exec(cmd); } catch (e) { ret = undefined; }
+    if (ret && typeof ret.then === 'function') {
+      ret.then(
+        r => {
+          if (r && typeof r === 'object') finish(r.errno, r.stdout, r.stderr);
+          else finish(0, String(r || ''), '');
+        },
+        e => finish(-1, '', String((e && e.message) || e))
+      );
+      return;
     }
+    if (ret && typeof ret === 'object') { finish(ret.errno, ret.stdout, ret.stderr); return; }
+    if (typeof ret === 'string') { finish(0, ret, ''); return; }
+    const cb = `cb_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    window[cb] = (errno, stdout, stderr) => {
+      delete window[cb];
+      finish(errno, stdout, stderr);
+    };
+    try { api.exec(cmd, '{}', cb); } catch (e) {
+      delete window[cb];
+      try { api.exec(cmd, {}, (errno, stdout, stderr) => finish(errno, stdout, stderr)); } catch (e2) {}
+    }
+    setTimeout(() => { delete window[cb]; finish(-1, '', 'timeout'); }, 15000);
   });
+}
+
+// Some KernelSU WebUI bridges return only the last line of stdout; base64 keeps
+// multi-line output on one line so apps.conf and package lists are never truncated.
+async function execMultiline(cmd) {
+  const b64 = (await execCmd(`(${cmd}) | base64 | tr -d '\\n'`)).trim();
+  if (!b64) return '';
+  try {
+    return decodeURIComponent(escape(atob(b64)));
+  } catch (e) {
+    return atob(b64);
+  }
 }
 
 async function loadConfig() {
   try {
-    const appsRaw = await execCmd(`cat "${APPS_CONF}" 2>/dev/null || true`);
+    const appsRaw = await execMultiline(`cat "${APPS_CONF}" 2>/dev/null || true`);
     appProfiles = {};
     for (const line of appsRaw.split('\n')) {
       const t = line.trim();
@@ -172,7 +208,7 @@ async function openAppPicker() {
   if (installedPkgs.length === 0) {
     listEl.innerHTML = '<div class="empty-state">Загрузка списка приложений...</div>';
     try {
-      const out = await execCmd('pm list packages -3 2>/dev/null || cmd package list packages -3 2>/dev/null');
+      const out = await execMultiline('pm list packages -3 2>/dev/null || cmd package list packages -3 2>/dev/null');
       installedPkgs = out.split('\n')
         .map(l => l.replace('package:', '').trim())
         .filter(Boolean)

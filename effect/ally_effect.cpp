@@ -236,15 +236,18 @@ public:
             case CommandId::START:
                 if (state_.load() == State::IDLE) {
                     state_.store(State::PROCESSING);
+                    ALOGI("command: START -> PROCESSING");
                 }
                 break;
             case CommandId::STOP:
                 if (state_.load() == State::PROCESSING) {
                     state_.store(State::IDLE);
+                    ALOGI("command: STOP -> IDLE");
                 }
                 break;
             case CommandId::RESET:
                 renderer_.reset();
+                ALOGI("command: RESET");
                 break;
             default:
                 break;
@@ -261,6 +264,14 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         if (param.getTag() == Parameter::common) {
             common_ = param.get<Parameter::common>();
+            if (common_.input.base.sampleRate > 0) {
+                sample_rate_ = static_cast<float>(common_.input.base.sampleRate);
+            }
+            in_channels_ = std::max(1, channel_count_from_layout(common_.input.base.channelMask));
+            out_channels_ = std::max(1, channel_count_from_layout(common_.output.base.channelMask));
+            if (common_.input.frameCount > 0) {
+                frame_count_ = static_cast<size_t>(common_.input.frameCount);
+            }
             return ndk::ScopedAStatus::ok();
         }
         if (param.getTag() == Parameter::specific) {
@@ -391,8 +402,14 @@ private:
         stop_worker_locked();
     }
 
+    // AOSP AIDL EffectHalAidl (V2+) wakes bit 2 (0x04) on statusMQ's event flag when
+    // inputDataMQ has new samples, keeping it distinct from FMQ_NOT_EMPTY (0x02) that
+    // statusMQ->readBlocking() waits on.
+    static constexpr uint32_t kEventFlagDataMqNotEmpty = 1u << 2;
+
     void stop_worker_locked() {
         if (worker_running_.exchange(false)) {
+            status_mq_.wake(kEventFlagDataMqNotEmpty);
             in_mq_.wake(0x02);
             if (worker_.joinable()) {
                 worker_.join();
@@ -410,22 +427,23 @@ private:
         auto last_stat = std::chrono::steady_clock::now();
         while (worker_running_.load()) {
             auto t_wait0 = std::chrono::steady_clock::now();
-            // Poll at 1 ms while audio flows, back off to 10 ms once the queue has
-            // been empty for a few rounds: an idle effect must not wake the mixer
-            // thread a thousand times a second.
-            const int wait_ms = idle_rounds_ < 3 ? 1 : 10;
-            if (!in_mq_.wait(1, wait_ms)) {
-                stat_timeouts++;
-                if (idle_rounds_ < 1000) idle_rounds_++;
+            if (in_mq_.available_to_read() < static_cast<size_t>(in_channels_)) {
+                // Wait on statusMQ's data-ready event flag (wakes immediately on V2+ HAL),
+                // with a short timeout fallback for V1 clients that wake FMQ_NOT_EMPTY.
+                const int wait_ms = idle_rounds_ < 5 ? 2 : 10;
+                status_mq_.wait(kEventFlagDataMqNotEmpty, wait_ms);
+                if (in_mq_.available_to_read() < static_cast<size_t>(in_channels_)) {
+                    stat_timeouts++;
+                    if (idle_rounds_ < 1000) idle_rounds_++;
+                } else {
+                    idle_rounds_ = 0;
+                }
             } else {
                 idle_rounds_ = 0;
             }
             auto t_proc0 = std::chrono::steady_clock::now();
             if (!worker_running_.load()) break;
 
-            // Process exactly one buffer per status message: that is what the HAL
-            // wrote, and a short or oversized reply makes it wait for the missing
-            // frames, which is audible as a hiccup.
             static auto last_beat = std::chrono::steady_clock::now();
             auto now_beat = std::chrono::steady_clock::now();
             if (std::chrono::duration_cast<std::chrono::milliseconds>(now_beat - last_beat).count() >= 2000) {
@@ -434,14 +452,16 @@ private:
                       frame_count_, (int)state_.load());
                 last_beat = now_beat;
             }
-            const size_t want_frames = frame_count_ > 0 ? frame_count_ : 1024;
-            const size_t need_in = want_frames * static_cast<size_t>(in_channels_);
-            const size_t need_out = want_frames * static_cast<size_t>(out_channels_);
-            if (static_cast<size_t>(in_mq_.available_to_read()) < need_in ||
-                static_cast<size_t>(out_mq_.available_to_write()) < need_out) {
+
+            // Consume the entire chunk AudioFlinger wrote: EffectHalAidl::process() checks
+            // retStatus.fmqConsumed == floatsToWrite, and floatsToWrite can be smaller than
+            // common.input.frameCount. Waiting for a full frame_count_ deadlocks playback.
+            const size_t avail_in_frames = in_mq_.available_to_read() / static_cast<size_t>(in_channels_);
+            const size_t avail_out_frames = out_mq_.available_to_write() / static_cast<size_t>(out_channels_);
+            const size_t frames = std::min(avail_in_frames, avail_out_frames);
+            if (frames == 0) {
                 continue;
             }
-            size_t frames = want_frames;
 
             in_buf.resize(frames * in_channels_);
             stereo_buf.resize(frames * 2);
