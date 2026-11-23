@@ -358,6 +358,10 @@ PipelinedVocals::~PipelinedVocals() {
     if (loader_.joinable()) {
         loader_.join();
     }
+    teardown();
+}
+
+void PipelinedVocals::teardown() {
     if (!impl_) return;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -372,9 +376,36 @@ PipelinedVocals::~PipelinedVocals() {
     impl_ = nullptr;
 }
 
+void PipelinedVocals::unload() {
+    // Only a finished load is torn down; one still in flight is left alone and
+    // unloaded on a later idle hop.
+    if (!ready_.load()) return;
+    if (loader_.joinable()) loader_.join();
+    ready_.store(false);
+    teardown();
+    npu_active_.store(false);
+    loading_.store(false);
+    VLOGI("separator unloaded after %d silent hops", silent_hops_);
+}
+
+void PipelinedVocals::note_hop(const float* stereo_in) {
+    double e = 0.0;
+    for (int i = 0; i < 2 * kHop; ++i) e += static_cast<double>(stereo_in[i]) * stereo_in[i];
+    const bool silent = std::sqrt(e / (2 * kHop)) <= kSilenceRms;
+    silent_hops_ = silent ? std::min(silent_hops_ + 1, kUnloadHops) : 0;
+    if (silent_hops_ >= kUnloadHops) unload();
+}
+
+void PipelinedVocals::idle(int frames) {
+    silent_hops_ = std::min(silent_hops_ + std::max(1, frames / kHop), kUnloadHops);
+    if (silent_hops_ >= kUnloadHops) unload();
+}
+
 bool PipelinedVocals::ensure_loaded(const char* model_path, bool use_npu) {
     if (ready_.load()) return true;
     if (failed_.load()) return false;
+    // Never load (or reload after an idle unload) for silence.
+    if (silent_hops_ > 0) return false;
     // Loading ONNX Runtime and compiling the graph takes hundreds of milliseconds;
     // doing it on the audio thread stalled playback the moment neural mode was
     // switched on. Load in the background and keep the passive path meanwhile.
@@ -487,6 +518,14 @@ void PipelinedVocals::process(const float* stereo_in, float* dry_out, float* res
         return;
     }
     Impl* d = impl_;
+    // Silence: once the pipeline has drained there is nothing left to separate, so
+    // the model is not run at all. The tick gap makes the pipeline resync and fade
+    // the model back in when sound returns.
+    if (silent_hops_ > delay_hops_ + 2) {
+        std::memset(dry_out, 0, 2 * kHop * sizeof(float));
+        std::memset(rest_out, 0, 2 * kHop * sizeof(float));
+        return;
+    }
     d->stat_hops.fetch_add(1, std::memory_order_relaxed);
     const size_t delay_hops = static_cast<size_t>(delay_hops_);
 

@@ -26,6 +26,10 @@ public:
     // After an underrun stay on the passive matrix for this long before fading the
     // model back in, so a borderline-slow device does not toggle at the block rate.
     static constexpr int kMissCooldownHops = 188; // ~0.5 s at 48 kHz
+    // Silence handling, as in the Ally plugin: once the pipeline has drained the
+    // model stops running, and after this long without sound it is unloaded.
+    static constexpr float kSilenceRms = 1e-5f;      // -100 dBFS
+    static constexpr int kUnloadHops = 3750;         // ~10 s at 48 kHz
 
     PipelinedVocals() = default;
     ~PipelinedVocals();
@@ -42,6 +46,12 @@ public:
     // Tells the pipeline how many frames the host delivers per call so the delay
     // can cover a whole block. Call from the audio thread before process().
     void note_block_frames(int frames);
+
+    // Call once per hop with the stereo input (planar, 2 * kHop) before
+    // ensure_loaded()/process(): tracks silence, gates inference, unloads when idle.
+    void note_hop(const float* stereo_in);
+    // The host delivered no audio at all for `frames` frames (stream stopped).
+    void idle(int frames);
 
     // Non-blocking process: feeds one stereo hop (planar: 2 * kHop) and outputs
     // time-aligned dry (2 * kHop) and rest = dry - vocals (2 * kHop).
@@ -61,6 +71,10 @@ private:
     // Audio-thread only.
     int delay_hops_ = kMinDelayHops;
     bool delay_changed_ = false;
+    int silent_hops_ = 0;
+
+    void unload();
+    void teardown();
 
     void load(bool use_npu);
     void worker_loop();

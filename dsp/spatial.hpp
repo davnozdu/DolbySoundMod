@@ -164,6 +164,15 @@ public:
     // Output is always interleaved stereo float frames.
     void process_interleaved(const float* in, float* out, int frames, int in_channels);
 
+    // The host had no audio for `frames` frames: lets the separator unload when idle.
+    void idle(int frames) {
+#ifdef ALLY_ENABLE_NPU
+        vocals_.idle(frames);
+#else
+        (void)frames;
+#endif
+    }
+
 private:
     float sample_rate_ = 48000.0f;
     Profile profile_ = Profile::Game;

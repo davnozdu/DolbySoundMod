@@ -437,6 +437,10 @@ private:
                 if (in_mq_.available_to_read() < static_cast<size_t>(in_channels_)) {
                     stat_timeouts++;
                     if (idle_rounds_ < 1000) idle_rounds_++;
+                    // No audio at all (paused/stopped stream): count it as silence so
+                    // the neural separator unloads instead of sitting in memory.
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    renderer_.idle(static_cast<int>(sample_rate_ * wait_ms / 1000.0f));
                 } else {
                     idle_rounds_ = 0;
                 }

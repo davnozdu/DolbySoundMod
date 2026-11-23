@@ -666,6 +666,9 @@ void Renderer::make_stereo_feeds(bool& has_lfe) {
     std::array<float, 2 * kHop> rear{};
 
 #ifdef ALLY_ENABLE_NPU
+    if (neural_ && (profile_ == Profile::Speech || profile_ == Profile::Movie)) {
+        vocals_.note_hop(&block_[0]);
+    }
     if (neural_ && profile_ == Profile::Speech &&
         vocals_.ensure_loaded(speech_model_path(), true)) {
         // Speech model: keep the voice, tuck everything else away. No room, no air -
