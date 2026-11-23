@@ -24,6 +24,7 @@ public class AllySoundCtl {
     private static final String NEURAL_CONF = BASE_DIR + "/neural.conf";
     private static final String REVERB_CONF = BASE_DIR + "/reverb.conf";
     private static final String UPMIX_CONF = BASE_DIR + "/upmix.conf";
+    private static final String AUTO_EQ_CONF = BASE_DIR + "/auto_eq.conf";
     private static final String STATUS_JSON = BASE_DIR + "/status.json";
 
     private static class SessionEffect {
@@ -33,6 +34,7 @@ public class AllySoundCtl {
         int neural;
         int reverb;
         int upmix;
+        int autoEq;
         int device;
     }
 
@@ -122,8 +124,8 @@ public class AllySoundCtl {
         }
     }
 
-    private static int readUpmixEnabled() {
-        File f = new File(UPMIX_CONF);
+    private static int readToggle(String path) {
+        File f = new File(path);
         if (!f.exists()) return 0;
         try (BufferedReader br = new BufferedReader(new FileReader(f))) {
             String line = br.readLine();
@@ -328,10 +330,11 @@ public class AllySoundCtl {
         return ctor.newInstance(TYPE_LOUDNESS, IMPL_ALLY, 0, sessionId);
     }
 
-    private static void setAllyParam(AudioEffect fx, int profile, int neural, int reverb, int upmix, int device) throws Exception {
+    private static void setAllyParam(AudioEffect fx, int profile, int neural, int reverb,
+                                     int upmix, int autoEq, int device) throws Exception {
         Method setParam = AudioEffect.class.getDeclaredMethod("setParameter", int.class, int.class);
         setParam.setAccessible(true);
-        int code = 30000 + upmix * 10000 + profile * 1000 + neural * 100 + reverb * 10 + device;
+        int code = 50000 + (2 * autoEq + upmix) * 10000 + profile * 1000 + neural * 100 + reverb * 10 + device;
         setParam.invoke(fx, 0 /* PARAM_TARGET_GAIN_MB */, code);
     }
 
@@ -352,6 +355,7 @@ public class AllySoundCtl {
               .append(",\"profile\":\"").append(profileName(se.profile)).append("\"")
               .append(",\"reverb\":").append(se.reverb != 0)
               .append(",\"upmix\":").append(se.upmix != 0)
+              .append(",\"auto_eq\":").append(se.autoEq != 0)
               .append(",\"neural\":").append(se.neural != 0).append("}");
         }
         sb.append("]}");
@@ -383,7 +387,8 @@ public class AllySoundCtl {
                 int device = detectOutputDevice(devMode);
                 int neural = readNeuralEnabled();
                 int reverb = readReverbEnabled();
-                int upmix = readUpmixEnabled();
+                int upmix = readToggle(UPMIX_CONF);
+                int autoEq = readToggle(AUTO_EQ_CONF);
                 Map<Integer, String> sessions = readActiveSessions();
 
                 // Remove stale or disabled sessions
@@ -418,7 +423,7 @@ public class AllySoundCtl {
                         if (failed != null && System.currentTimeMillis() - failed < 15000) continue;
                         try {
                             AudioEffect fx = createAllyEffect(sid);
-                            setAllyParam(fx, prof, neural, reverb, upmix, device);
+                            setAllyParam(fx, prof, neural, reverb, upmix, autoEq, device);
                             fx.setEnabled(true);
                             se = new SessionEffect();
                             se.effect = fx;
@@ -427,6 +432,7 @@ public class AllySoundCtl {
                             se.neural = neural;
                             se.reverb = reverb;
                             se.upmix = upmix;
+                            se.autoEq = autoEq;
                             se.device = device;
                             active.put(sid, se);
                             failedAt.remove(sid);
@@ -436,13 +442,14 @@ public class AllySoundCtl {
                             lastError = e.getClass().getSimpleName() + ": " + e.getMessage();
                         }
                     } else if (se.profile != prof || se.neural != neural || se.reverb != reverb ||
-                               se.upmix != upmix || se.device != device) {
+                               se.upmix != upmix || se.autoEq != autoEq || se.device != device) {
                         try {
-                            setAllyParam(se.effect, prof, neural, reverb, upmix, device);
+                            setAllyParam(se.effect, prof, neural, reverb, upmix, autoEq, device);
                             se.profile = prof;
                             se.neural = neural;
                             se.reverb = reverb;
                             se.upmix = upmix;
+                            se.autoEq = autoEq;
                             se.device = device;
                             lastError = null;
                         } catch (Exception e) {

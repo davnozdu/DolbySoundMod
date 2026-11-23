@@ -4,6 +4,9 @@
 #ifdef ALLY_ENABLE_NPU
 #include "vocals.hpp"
 #endif
+#ifdef ALLY_ENABLE_AUTO_EQ
+#include "auto_eq.hpp"
+#endif
 #include <array>
 #include <complex>
 #include <cstdint>
@@ -181,18 +184,21 @@ public:
     void set_neural(bool enabled) { neural_ = enabled; }
     void set_reverb(bool enabled) { reverb_ = enabled; }
     void set_bypass(bool bypass) { bypass_ = bypass; }
-    // Coherence upmix instead of the passive matrix for stereo sources (neural
-    // separation, when active, keeps its own path).
-    void set_upmix(bool enabled) {
-        if (enabled && !upmix_on_) upmix_.reset();
-        upmix_on_ = enabled;
-    }
+    // Coherence upmix for stereo sources, including the bed of a neural mix.
+    void set_upmix(bool enabled);
     bool upmix() const { return upmix_on_; }
+    bool upmix_active() const {
+        return upmix_on_ && !is_surround_ && !bypass_ && profile_ != Profile::Off;
+    }
 
     Profile profile() const { return profile_; }
     DeviceKind device() const { return device_; }
     bool neural() const { return neural_; }
     bool reverb() const { return reverb_; }
+#ifdef ALLY_ENABLE_AUTO_EQ
+    void set_auto_eq(bool enabled) { auto_eq_.set_enabled(enabled); }
+    const char* auto_eq_profile() const { return auto_eq_.profile(); }
+#endif
     bool npu_active() const {
 #ifdef ALLY_ENABLE_NPU
         return vocals_.using_npu();
@@ -207,10 +213,12 @@ public:
 
     // The host had no audio for `frames` frames: lets the separator unload when idle.
     void idle(int frames) {
+        (void)frames;
 #ifdef ALLY_ENABLE_NPU
         vocals_.idle(frames);
-#else
-        (void)frames;
+#endif
+#ifdef ALLY_ENABLE_AUTO_EQ
+        auto_eq_.idle(frames);
 #endif
     }
 
@@ -226,6 +234,11 @@ private:
 
 #ifdef ALLY_ENABLE_NPU
     PipelinedVocals vocals_;
+    DelayLine upmix_dialogue_delay_;
+    bool upmix_uses_neural_ = false;
+#endif
+#ifdef ALLY_ENABLE_AUTO_EQ
+    AutoEq auto_eq_;
 #endif
     BiquadFilter cinema_air_;
     BiquadFilter speech_hp_;

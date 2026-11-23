@@ -4,6 +4,7 @@ const DEVICE_CONF = `${DATA_DIR}/device.conf`;
 const NEURAL_CONF = `${DATA_DIR}/neural.conf`;
 const REVERB_CONF = `${DATA_DIR}/reverb.conf`;
 const UPMIX_CONF = `${DATA_DIR}/upmix.conf`;
+const AUTO_EQ_CONF = `${DATA_DIR}/auto_eq.conf`;
 const AUTO_UPDATE_CONF = `${DATA_DIR}/auto_update.conf`;
 const STATUS_JSON = `${DATA_DIR}/status.json`;
 const MOD_DIR = '/data/adb/modules/allysound';
@@ -84,6 +85,8 @@ async function loadConfig() {
     document.getElementById('toggle-reverb').checked = (reverbRaw === '1');
     const upmixRaw = (await execCmd(`cat "${UPMIX_CONF}" 2>/dev/null || echo 0`)).trim();
     document.getElementById('toggle-upmix').checked = (upmixRaw === '1');
+    const eqRaw = (await execCmd(`cat "${AUTO_EQ_CONF}" 2>/dev/null || echo 0`)).trim();
+    document.getElementById('toggle-auto-eq').checked = (eqRaw === '1');
     const autoUpdRaw = (await execCmd(`cat "${AUTO_UPDATE_CONF}" 2>/dev/null || echo 1`)).trim();
     document.getElementById('toggle-autoupdate').checked = (autoUpdRaw !== '0');
   } catch (e) {
@@ -263,14 +266,25 @@ document.querySelectorAll('#device-selector .seg-btn').forEach(btn => {
   btn.onclick = () => saveDevice(btn.dataset.dev);
 });
 document.getElementById('btn-pick-app').onclick = openAppPicker;
-document.getElementById('btn-done-picker').onclick = () => {
+function closeAppPicker() {
+  document.getElementById('app-search').blur();
   document.getElementById('app-modal').classList.add('hidden');
   renderApps();
-};
-document.getElementById('btn-close-modal').onclick = () => {
-  document.getElementById('app-modal').classList.add('hidden');
-};
+  document.getElementById('btn-pick-app').focus();
+}
+document.getElementById('btn-done-picker').onclick = closeAppPicker;
 document.getElementById('app-search').oninput = (e) => renderPickerList(e.target.value);
+document.getElementById('app-search-form').onsubmit = (e) => {
+  e.preventDefault();
+  closeAppPicker();
+};
+document.getElementById('app-modal').onkeydown = (e) => {
+  if (e.isComposing) return;
+  if (e.key === 'Escape' || (e.key === 'Enter' && e.target.id === 'app-search')) {
+    e.preventDefault();
+    closeAppPicker();
+  }
+};
 
 document.getElementById('toggle-neural').onchange = async (e) => {
   const v = e.target.checked ? '1' : '0';
@@ -285,6 +299,11 @@ document.getElementById('toggle-reverb').onchange = async (e) => {
 document.getElementById('toggle-upmix').onchange = async (e) => {
   const v = e.target.checked ? '1' : '0';
   await execCmd(`mkdir -p "${DATA_DIR}" && echo "${v}" > "${UPMIX_CONF}"`);
+};
+
+document.getElementById('toggle-auto-eq').onchange = async (e) => {
+  const v = e.target.checked ? '1' : '0';
+  await execCmd(`mkdir -p "${DATA_DIR}" && echo "${v}" > "${AUTO_EQ_CONF}"`);
 };
 
 document.getElementById('toggle-autoupdate').onchange = async (e) => {

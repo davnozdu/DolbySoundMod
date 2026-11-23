@@ -29,6 +29,9 @@ jobs:
         run: |
           g++ -std=c++17 -O2 -Wall -Wextra -Idsp dsp/spatial.cpp dsp/test_dsp.cpp -o test_dsp -lm
           ./test_dsp
+          g++ -std=c++17 -O2 -Wall -Wextra -DALLY_ENABLE_NPU -Idsp \
+            dsp/spatial.cpp dsp/test_neural_upmix.cpp -o test_neural_upmix -lm -pthread
+          ./test_neural_upmix
 
       - name: Locate Android NDK & Build-Tools
         run: |
@@ -185,12 +188,15 @@ jobs:
       # liballysoundaidl.so. libc++ is linked statically (the NDK has no libc++.so
       # stub, and the platform .so exports std::__1 while NDK headers emit
       # std::__ndk1), so the only DT_NEEDED entries are system libraries.
+      - name: Fetch auto EQ models
+        run: bash tools/fetch_auto_eq_models.sh models/auto-eq
+
       - name: Build liballysoundaidl.so (arm64-v8a)
         run: |
           set -euo pipefail
           NDK_BIN="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin"
           export CXX="$NDK_BIN/aarch64-linux-android35-clang++"
-          export FLAGS="-std=c++20 -O2 -fPIC -fvisibility=default -fvisibility-inlines-hidden -DALLY_ENABLE_NPU -Iaidl_gen/include -Idsp -Ieffect -Ionnxruntime/headers -Ithird_party/libfmq/include -Ithird_party/libfmq/base -Ithird_party/shim -I$BINDER_INC/include_cpp -I$BINDER_INC/include_ndk"
+          export FLAGS="-std=c++20 -O2 -fPIC -fvisibility=default -fvisibility-inlines-hidden -DALLY_ENABLE_NPU -DALLY_ENABLE_AUTO_EQ -Iaidl_gen/include -Idsp -Ieffect -Ionnxruntime/headers -Ithird_party/libfmq/include -Ithird_party/libfmq/base -Ithird_party/shim -I$BINDER_INC/include_cpp -I$BINDER_INC/include_ndk"
           mkdir -p build_arm64
           rm -f build_arm64/*.o
 
@@ -207,7 +213,7 @@ jobs:
           echo "compiled ${#objs[@]} AIDL translation units"
 
           "$CXX" $FLAGS -shared -static-libstdc++ -Wl,--exclude-libs,ALL -Wl,-soname,liballysoundaidl.so \
-            "${objs[@]}" dsp/spatial.cpp dsp/vocals.cpp effect/ally_effect.cpp \
+            "${objs[@]}" dsp/spatial.cpp dsp/vocals.cpp dsp/auto_eq.cpp effect/ally_effect.cpp \
             third_party/libfmq/src/EventFlag.cpp third_party/libfmq/src/FmqInternal.cpp \
             third_party/libfmq/src/ErasedMessageQueue.cpp \
             -lbinder_ndk -llog -lm -ldl \
@@ -216,7 +222,7 @@ jobs:
           # Same code, second identity: the vendor HAL loads this file by name, so its
           # soname must match the file that ends up in /odm/lib64/soundfx.
           "$CXX" $FLAGS -shared -static-libstdc++ -Wl,--exclude-libs,ALL -Wl,-soname,libOplusAudioxAidl.so \
-            "${objs[@]}" dsp/spatial.cpp dsp/vocals.cpp effect/ally_effect.cpp \
+            "${objs[@]}" dsp/spatial.cpp dsp/vocals.cpp dsp/auto_eq.cpp effect/ally_effect.cpp \
             third_party/libfmq/src/EventFlag.cpp third_party/libfmq/src/FmqInternal.cpp \
             third_party/libfmq/src/ErasedMessageQueue.cpp \
             -lbinder_ndk -llog -lm -ldl \
@@ -255,6 +261,7 @@ jobs:
           cp build_arm64/libOplusAudioxAidl.so dist/module/vendor/lib64/soundfx/libOplusAudioxAidl.so
           cp onnxruntime/jni/arm64-v8a/libonnxruntime.so dist/module/vendor/lib64/libonnxruntime.so
           cp models/vocals_backbone.onnx models/vocals_dsp.bin dist/module/vendor/etc/allysound/
+          cp models/auto-eq/{yamnet.onnx,yamnet.data,msd-musicnn-1.onnx} dist/module/vendor/etc/allysound/
           cp -r models/ally-qnn dist/module/vendor/etc/allysound/
           cp onnxruntime/qnn/licenses/* dist/module/licenses/
           cp tools/train/WEIGHTS-LICENSE.md dist/module/licenses/StemgenRT-WEIGHTS-LICENSE.md

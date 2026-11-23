@@ -1,5 +1,6 @@
 #include "vocals.hpp"
 #include "fft.hpp"
+#include "qnn_runtime.hpp"
 
 #include <dlfcn.h>
 #include <unistd.h>
@@ -162,18 +163,18 @@ bool load_dsp_params(const std::string& path, SharedModel* m) {
 bool load_qnn(SharedModel* m, const std::string& dir) {
     const std::string backend = dir + "libQnnHtp.so";
     if (!ORT_OK(m->api->AddSessionConfigEntry(m->opts, "session.disable_cpu_ep_fallback", "1"))) return false;
-    const char* previous_path = std::getenv("ADSP_LIBRARY_PATH");
-    const bool had_path = previous_path != nullptr;
-    const std::string dsp_path = dir + (previous_path ? ";" + std::string(previous_path) : "");
-    if (setenv("ADSP_LIBRARY_PATH", dsp_path.c_str(), 1) != 0) return false;
     const std::string core = dir + "vocals_core.onnx";
     const std::string decoder = dir + "vocals_decoder.onnx";
     const char* keys[] = {"backend_path", "enable_htp_fp16_precision", "htp_performance_mode"};
-    const char* values[] = {backend.c_str(), "1", "burst"};
-    const bool ready = ORT_OK(m->api->SessionOptionsAppendExecutionProvider(m->opts, "QNN", keys, values, 3)) &&
-                       ORT_OK(m->api->CreateSession(m->env, decoder.c_str(), m->opts, &m->qnn_decoder));
-    if (had_path) setenv("ADSP_LIBRARY_PATH", dsp_path.c_str() + dir.size() + 1, 1);
-    else unsetenv("ADSP_LIBRARY_PATH");
+    // Balanced, not burst: the decoder is ~2 ms of work per 40 ms block, so the
+    // highest clock vote only costs battery.
+    const char* values[] = {backend.c_str(), "1", kQnnRealtimeMode};
+    const auto ok = [m](OrtStatus* status) { return ORT_OK(status); };
+    const bool ready = with_qnn_library_path(dir, [&] {
+        return ORT_OK(m->api->SessionOptionsAppendExecutionProvider(m->opts, "QNN", keys, values, 3)) &&
+               create_cached_qnn_session(m->api, m->env, m->opts, decoder, "vocals_decoder_ctx.onnx",
+                                         &m->qnn_decoder, ok);
+    });
     if (!ready) return false;
 
     OrtSessionOptions* cpu = nullptr;
@@ -529,9 +530,17 @@ struct PipelinedVocals::Impl {
                 return ORT_OK(api->Run(session, nullptr, &decoder_input, &encoded, 1, &decoder_output, 1, &mask)) &&
                        data(mask, kQnnHops * mask_size, &masks);
             };
-            ok = m->qnn_healthy.load() && decode(m->qnn_decoder);
+            ok = false;
+            if (m->qnn_healthy.load()) {
+                std::unique_lock<std::mutex> qnn_lock(qnn_mutex(), std::try_to_lock);
+                if (qnn_lock) {
+                    ok = decode(m->qnn_decoder);
+                    if (!ok && m->qnn_healthy.exchange(false)) {
+                        VLOGE("QNN decoder failed; switching to CPU mask decoder");
+                    }
+                }
+            }
             if (!ok) {
-                if (m->qnn_healthy.exchange(false)) VLOGE("QNN decoder failed; switching to CPU mask decoder");
                 if (mask) { api->ReleaseValue(mask); mask = nullptr; }
                 ok = decode(m->cpu_decoder);
             }
@@ -739,9 +748,9 @@ void PipelinedVocals::note_block_frames(int frames) {
     const int hops = std::max(1, (frames + kHop - 1) / kHop);
     int requested = hops + kMarginHops;
     if (ready_.load() && impl_->batched) {
-        // A decoder batch can straddle callbacks when callback and batch widths differ.
-        requested = std::max(hops, kQnnHops) + kQnnMarginHops +
-                    (hops == kQnnHops ? 0 : std::min(hops, kQnnHops) - 1);
+        // A batch may start mid-callback after a silent interval or pipeline resync,
+        // even when both lengths are equal.
+        requested = hops + kQnnHops - 1 + kQnnMarginHops;
     }
     const int needed = std::clamp(requested, kMinDelayHops, kMaxDelayHops);
     // Only grow: AudioFlinger occasionally hands over a short tail, which must not

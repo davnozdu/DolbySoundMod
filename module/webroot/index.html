@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, interactive-widget=resizes-content" />
   <title>DolbySoundMod</title>
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -53,10 +53,21 @@
       <div class="toggle-row">
         <div>
           <div class="toggle-title">Точный апмикс 7.1</div>
-          <div class="toggle-sub">Стерео раскладывается по частотам: прямой звук остаётся там, где он в миксе (лево/центр/право), атмосфера уходит на боковые и тылы. Выключено — простая матрица, как в плагине Ally.</div>
+          <div class="toggle-sub">Распределяет стереозвук по виртуальным каналам. В профиле «Фильм» с нейросетью диалог остаётся в центре.</div>
         </div>
         <label class="switch">
           <input type="checkbox" id="toggle-upmix" />
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="divider"></div>
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-title">Автоэквалайзер</div>
+          <div class="toggle-sub">Распознаёт речь и жанры музыки, плавно меняет тембр в приложениях с включённым профилем.</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="toggle-auto-eq" />
           <span class="slider"></span>
         </label>
       </div>
@@ -85,18 +96,17 @@
     </section>
   </div>
 
-  <div id="app-modal" class="modal hidden">
+  <div id="app-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="app-picker-title">
     <div class="modal-content">
       <div class="modal-header">
-        <h2>Выбрать приложение</h2>
-        <button id="btn-close-modal" class="btn-icon">&times;</button>
+        <h2 id="app-picker-title">Выбрать приложение</h2>
+        <button id="btn-done-picker" type="button" class="btn-primary">Готово</button>
       </div>
-      <input id="app-search" type="search" class="search-input" placeholder="Поиск (youtube, vlc, spotify...)" />
+      <form id="app-search-form" role="search">
+        <input id="app-search" type="search" class="search-input" enterkeyhint="done" placeholder="Поиск (youtube, vlc, spotify...)" />
+      </form>
       <div id="modal-apps-list" class="modal-list">
         <div class="empty-state">Загрузка списка приложений...</div>
-      </div>
-      <div class="modal-footer">
-        <button id="btn-done-picker" class="btn-primary btn-full">Готово</button>
       </div>
     </div>
   </div>

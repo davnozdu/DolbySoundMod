@@ -108,8 +108,8 @@ stage_soundfx() {
     if [ -f "$MODDIR/vendor/lib64/libonnxruntime.so" ]; then
         cp -f "$MODDIR/vendor/lib64/libonnxruntime.so" "$STAGE/"
     fi
-    # Neural separator: backbone model + DSP parameters (tools/make_cpu_model.py).
-    for f in vocals_backbone.onnx vocals_dsp.bin; do
+    # Stage the separator and auto EQ models next to the vendor effect library.
+    for f in vocals_backbone.onnx vocals_dsp.bin yamnet.onnx yamnet.data msd-musicnn-1.onnx; do
         if [ -f "$MODDIR/vendor/etc/allysound/$f" ]; then
             cp -f "$MODDIR/vendor/etc/allysound/$f" "$STAGE/$f"
             chmod 0644 "$STAGE/$f"
@@ -160,6 +160,17 @@ stage_soundfx() {
 # the separator is staged into soundfx above, so drop the 11 MB leftover.
 install_model() {
     rm -f "$DATA_DIR/vocals.onnx"
+    # Compiled Hexagon graphs (dsp/qnn_runtime.hpp). Emptied at every boot so a module
+    # update never meets a graph prepared for older models or QNN libraries; the HAL
+    # (uid audioserver, gid audio) writes them on first use.
+    QNN_CACHE=/data/vendor/audio/allysound_qnn
+    if [ -d /data/vendor/audio ]; then
+        rm -rf "$QNN_CACHE"
+        mkdir -p "$QNN_CACHE"
+        chown 1041:1005 "$QNN_CACHE"
+        chmod 0770 "$QNN_CACHE"
+        chcon u:object_r:vendor_audio_data_file:s0 "$QNN_CACHE" 2>/dev/null
+    fi
 }
 
 if [ -f /odm/etc/audio_effects_config.xml ]; then

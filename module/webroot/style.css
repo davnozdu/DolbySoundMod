@@ -184,6 +184,7 @@ h1 { margin: 0; font-size: 20px; font-weight: 700; }
   width: 100%;
   max-width: 600px;
   height: 78vh;
+  height: 78dvh;
   background: var(--card);
   border-top-left-radius: 18px;
   border-top-right-radius: 18px;
@@ -196,16 +197,12 @@ h1 { margin: 0; font-size: 20px; font-weight: 700; }
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
   margin-bottom: 10px;
 }
 .modal-header h2 { margin: 0; font-size: 17px; }
-.btn-icon {
-  border: none;
-  background: transparent;
-  color: var(--text);
-  font-size: 24px;
-  cursor: pointer;
-}
+.modal-header .btn-primary { min-height: 44px; flex-shrink: 0; }
 
 .search-input {
   width: 100%;
@@ -220,19 +217,12 @@ h1 { margin: 0; font-size: 20px; font-weight: 700; }
 
 .modal-list {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
-
-.modal-footer {
-  padding-top: 10px;
-  border-top: 1px solid var(--card-border);
-  margin-top: 10px;
-}
-
-.btn-full { width: 100%; padding: 11px 12px; }
 
 .modal-item {
   text-align: left;

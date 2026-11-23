@@ -657,6 +657,9 @@ void Renderer::init(float sample_rate) {
     }
 
     ambience_delay_.init(2, static_cast<int>(kAmbienceDelaySec * sample_rate));
+#ifdef ALLY_ENABLE_NPU
+    upmix_dialogue_delay_.init(2, CoherenceUpmix::kN - kHop);
+#endif
     speaker_delay_.init(1, static_cast<int>(0.012f * sample_rate));
     lfe_filter_.configure_lowpass_2nd(120.0f, sample_rate, 1);
     speaker_lfe_.configure_lowpass_2nd(120.0f, sample_rate, 1);
@@ -668,6 +671,9 @@ void Renderer::init(float sample_rate) {
     speech_presence_.configure_high_shelf(2800.0f, 4.5f, sample_rate, 2);
     widener_.init(sample_rate);
     upmix_.init(sample_rate);
+#ifdef ALLY_ENABLE_AUTO_EQ
+    auto_eq_.init(sample_rate);
+#endif
     dynamics_.init(sample_rate);
 
     set_profile(profile_);
@@ -685,6 +691,13 @@ void Renderer::reset() {
     cinema_air_.reset();
     widener_.reset();
     upmix_.reset();
+#ifdef ALLY_ENABLE_AUTO_EQ
+    auto_eq_.reset();
+#endif
+#ifdef ALLY_ENABLE_NPU
+    upmix_dialogue_delay_.reset();
+    upmix_uses_neural_ = false;
+#endif
     dynamics_.reset();
     clock_ = 0.0;
     surround_seen_ = -1e9;
@@ -708,6 +721,17 @@ void Renderer::set_profile(Profile p) {
 
 void Renderer::set_device(DeviceKind d) {
     device_ = d;
+}
+
+void Renderer::set_upmix(bool enabled) {
+    if (enabled && !upmix_on_) {
+        upmix_.reset();
+#ifdef ALLY_ENABLE_NPU
+        upmix_dialogue_delay_.reset();
+        upmix_uses_neural_ = false;
+#endif
+    }
+    upmix_on_ = enabled;
 }
 
 bool Renderer::detect_surround() {
@@ -737,6 +761,7 @@ void Renderer::make_stereo_feeds(bool& has_lfe) {
     std::array<float, 2 * kHop> rear{};
 
 #ifdef ALLY_ENABLE_NPU
+    std::array<float, 2 * kHop> dialogue_lfe;
     if (neural_ && (profile_ == Profile::Speech || profile_ == Profile::Movie)) {
         vocals_.note_hop(&block_[0]);
     }
@@ -754,43 +779,62 @@ void Renderer::make_stereo_feeds(bool& has_lfe) {
     }
     if (neural_ && profile_ == Profile::Movie &&
         vocals_.ensure_loaded(vocals_model_path(), true)) {
+        constexpr float kVoiceToCentre = 0.75f;
         std::array<float, 2 * kHop> dry{};
         std::array<float, 2 * kHop> sep_rest{};
         vocals_.process(&block_[0], dry.data(), sep_rest.data(), tick_);
 
-        std::array<float, kHop> air_l{}, air_r{};
-        cinema_air_.process(&sep_rest[0], air_l.data(), 0, kHop);
-        cinema_air_.process(&sep_rest[kHop], air_r.data(), 1, kHop);
-
-        for (int i = 0; i < kHop; ++i) {
-            float vl = (dry[i] - sep_rest[i]) * 0.75f;
-            float vr = (dry[kHop + i] - sep_rest[kHop + i]) * 0.75f;
-            float al = air_l[i] * 0.26f;
-            float ar = air_r[i] * 0.26f;
-            float rl = dry[i] - vl + al;
-            float rr = dry[kHop + i] - vr + ar;
-            float amb_l = sep_rest[i] + al;
-            float amb_r = sep_rest[kHop + i] + ar;
-            feeds_[0 * kHop + i] = rl;
-            feeds_[1 * kHop + i] = rr;
-            feeds_[2 * kHop + i] = 0.5f * (vl + vr) * cfg.dialogue;
-            amb[0 * kHop + i] = amb_l - 0.7f * amb_r;
-            amb[1 * kHop + i] = amb_r - 0.7f * amb_l;
-            lfe_[i] = 0.5f * (sep_rest[i] + sep_rest[kHop + i]) * 0.25f;
-        }
         has_lfe = true;
-        ambience_delay_.process(amb.data(), rear.data(), kHop);
-        for (int i = 0; i < kHop; ++i) {
-            feeds_[3 * kHop + i] = rear[0 * kHop + i] * 0.52f;
-            feeds_[4 * kHop + i] = rear[1 * kHop + i] * 0.52f;
-            feeds_[5 * kHop + i] = amb[0 * kHop + i] * 0.58f;
-            feeds_[6 * kHop + i] = amb[1 * kHop + i] * 0.58f;
+        if (upmix_on_) {
+            for (int i = 0; i < kHop; ++i) {
+                const float vl = (dry[i] - sep_rest[i]) * kVoiceToCentre;
+                const float vr = (dry[kHop + i] - sep_rest[kHop + i]) * kVoiceToCentre;
+                block_[i] = dry[i] - vl;
+                block_[kHop + i] = dry[kHop + i] - vr;
+                dialogue_lfe[i] = 0.5f * (vl + vr);
+                dialogue_lfe[kHop + i] = 0.125f * (sep_rest[i] + sep_rest[kHop + i]);
+            }
+        } else {
+            std::array<float, kHop> air_l{}, air_r{};
+            cinema_air_.process(&sep_rest[0], air_l.data(), 0, kHop);
+            cinema_air_.process(&sep_rest[kHop], air_r.data(), 1, kHop);
+
+            for (int i = 0; i < kHop; ++i) {
+                float vl = (dry[i] - sep_rest[i]) * kVoiceToCentre;
+                float vr = (dry[kHop + i] - sep_rest[kHop + i]) * kVoiceToCentre;
+                float al = air_l[i] * 0.26f;
+                float ar = air_r[i] * 0.26f;
+                float rl = dry[i] - vl + al;
+                float rr = dry[kHop + i] - vr + ar;
+                float amb_l = sep_rest[i] + al;
+                float amb_r = sep_rest[kHop + i] + ar;
+                feeds_[0 * kHop + i] = rl;
+                feeds_[1 * kHop + i] = rr;
+                feeds_[2 * kHop + i] = 0.5f * (vl + vr) * cfg.dialogue;
+                amb[0 * kHop + i] = amb_l - 0.7f * amb_r;
+                amb[1 * kHop + i] = amb_r - 0.7f * amb_l;
+                lfe_[i] = 0.5f * (sep_rest[i] + sep_rest[kHop + i]) * 0.25f;
+            }
+            ambience_delay_.process(amb.data(), rear.data(), kHop);
+            for (int i = 0; i < kHop; ++i) {
+                feeds_[3 * kHop + i] = rear[0 * kHop + i] * 0.52f;
+                feeds_[4 * kHop + i] = rear[1 * kHop + i] * 0.52f;
+                feeds_[5 * kHop + i] = amb[0 * kHop + i] * 0.58f;
+                feeds_[6 * kHop + i] = amb[1 * kHop + i] * 0.58f;
+            }
+            return;
         }
-        return;
     }
 #endif
 
     if (upmix_on_) {
+#ifdef ALLY_ENABLE_NPU
+        if (has_lfe != upmix_uses_neural_) {
+            upmix_.reset();
+            upmix_dialogue_delay_.reset();
+            upmix_uses_neural_ = has_lfe;
+        }
+#endif
         std::array<float, kHop> centre{};
         upmix_.process(fl, fr, &feeds_[0 * kHop], &feeds_[1 * kHop], centre.data(),
                        &amb[0 * kHop], &amb[1 * kHop]);
@@ -801,6 +845,16 @@ void Renderer::make_stereo_feeds(bool& has_lfe) {
             amb[0 * kHop + i] *= kUpmixMakeup;
             amb[1 * kHop + i] *= kUpmixMakeup;
         }
+#ifdef ALLY_ENABLE_NPU
+        if (has_lfe) {
+            // The STFT delays the bed. Keep the separated centre and LFE aligned with it.
+            upmix_dialogue_delay_.process(dialogue_lfe.data(), dialogue_lfe.data(), kHop);
+            for (int i = 0; i < kHop; ++i) {
+                feeds_[2 * kHop + i] += dialogue_lfe[i] * cfg.dialogue;
+                lfe_[i] = dialogue_lfe[kHop + i];
+            }
+        }
+#endif
     } else {
         for (int i = 0; i < kHop; ++i) {
             float mid = 0.5f * (fl[i] + fr[i]);
@@ -972,6 +1026,12 @@ void Renderer::process_hop() {
     if (bypass_) {
         downmix(out_l, out_r);
     } else {
+#ifdef ALLY_ENABLE_AUTO_EQ
+        if (auto_eq_.enabled()) {
+            downmix(out_l, out_r);
+            auto_eq_.observe(out_l, out_r);
+        }
+#endif
         bool has_lfe = false;
         if (surround) {
             make_surround_feeds(has_lfe);
@@ -990,6 +1050,9 @@ void Renderer::process_hop() {
             out_l[i] *= trim;
             out_r[i] *= trim;
         }
+#ifdef ALLY_ENABLE_AUTO_EQ
+        auto_eq_.apply(out_l, out_r);
+#endif
     }
 
     const auto cfg = get_profile_params(profile_);
