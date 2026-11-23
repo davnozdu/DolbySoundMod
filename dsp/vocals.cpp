@@ -1,6 +1,8 @@
 #include "vocals.hpp"
+#include "fft.hpp"
 
 #include <dlfcn.h>
+#include <unistd.h>
 #include <onnxruntime_c_api.h>
 #include <nnapi_provider_factory.h>
 
@@ -8,6 +10,8 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <complex>
+#include <cstdio>
 #include <cstring>
 #include <string>
 
@@ -91,8 +95,20 @@ struct SharedModel {
     std::vector<std::string> output_names;
     std::vector<std::vector<int64_t>> state_shapes;
     std::vector<size_t> state_sizes;
+    std::vector<int64_t> in0_shape;
+    size_t in0_size = 0;
     bool npu = false;
     int refs = 0;
+
+    // Split model (tools/make_cpu_model.py): ONNX Runtime only runs the backbone;
+    // the FFT front end and the mask/overlap-add back end run here, sharing one
+    // real FFT per hop instead of three generic DFTs inside the graph.
+    bool split = false;
+    std::vector<float> analysis;     // kFft
+    std::vector<float> synthesis;    // 2 * kHop
+    std::vector<float> denominator;  // kHop
+    float eps_add = 0.0f;
+    float clip_min = 0.0f;
 
     ~SharedModel() {
         if (api) {
@@ -108,10 +124,44 @@ struct SharedModel {
 std::mutex g_model_mutex;
 SharedModel* g_model = nullptr;
 
+constexpr int kFft = 1024;
+constexpr int kBins = kFft / 2 + 1;
+constexpr int kHistory = kFft - kHop;
+
+bool load_dsp_params(const std::string& path, SharedModel* m) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) return false;
+    char magic[8] = {};
+    uint32_t version = 0;
+    m->analysis.resize(kFft);
+    m->synthesis.resize(2 * kHop);
+    m->denominator.resize(kHop);
+    bool ok = std::fread(magic, 1, 8, f) == 8 && std::memcmp(magic, "ALLYVDSP", 8) == 0 &&
+              std::fread(&version, 4, 1, f) == 1 && version == 1 &&
+              std::fread(m->analysis.data(), 4, kFft, f) == static_cast<size_t>(kFft) &&
+              std::fread(m->synthesis.data(), 4, 2 * kHop, f) == static_cast<size_t>(2 * kHop) &&
+              std::fread(m->denominator.data(), 4, kHop, f) == static_cast<size_t>(kHop) &&
+              std::fread(&m->eps_add, 4, 1, f) == 1 && std::fread(&m->clip_min, 4, 1, f) == 1;
+    std::fclose(f);
+    if (!ok) VLOGE("bad DSP parameter file %s", path.c_str());
+    return ok;
+}
+
 #define ORT_OK(expr) (([&]() { OrtStatus* _s = (expr); if (_s) { VLOGE("%s: %s", #expr, m->api->GetErrorMessage(_s)); m->api->ReleaseStatus(_s); return false; } return true; })())
 
-SharedModel* load_model(const char* model_path, bool use_npu) {
+SharedModel* load_model(const char* full_model_path, bool use_npu) {
     auto* m = new SharedModel();
+    std::string path = full_model_path;
+    {
+        const std::string dir = path.substr(0, path.find_last_of('/') + 1);
+        const std::string backbone = dir + "vocals_backbone.onnx";
+        if (path.find("vocals.onnx") != std::string::npos && access(backbone.c_str(), R_OK) == 0 &&
+            load_dsp_params(dir + "vocals_dsp.bin", m)) {
+            path = backbone;
+            m->split = true;
+        }
+    }
+    const char* model_path = path.c_str();
     static const char* kOrtCandidates[] = {
         "libonnxruntime.so",
         "/vendor/lib64/soundfx/libonnxruntime.so",
@@ -200,7 +250,6 @@ SharedModel* load_model(const char* model_path, bool use_npu) {
         ORT_OK(m->api->SessionGetInputName(m->session, i, alloc, &name));
         m->input_names.emplace_back(name ? name : "");
         if (name) ORT_OK(m->api->AllocatorFree(alloc, name));
-        if (i == 0) continue;
         OrtTypeInfo* ti = nullptr;
         const OrtTensorTypeAndShapeInfo* si = nullptr;
         size_t dims = 0;
@@ -214,8 +263,13 @@ SharedModel* load_model(const char* model_path, bool use_npu) {
             if (dim <= 0) dim = 1;
             total *= static_cast<size_t>(dim);
         }
-        m->state_shapes.push_back(std::move(shape));
-        m->state_sizes.push_back(total);
+        if (i == 0) {
+            m->in0_shape = std::move(shape);
+            m->in0_size = total;
+        } else {
+            m->state_shapes.push_back(std::move(shape));
+            m->state_sizes.push_back(total);
+        }
         m->api->ReleaseTypeInfo(ti);
     }
     for (size_t i = 0; i < num_out; ++i) {
@@ -224,12 +278,14 @@ SharedModel* load_model(const char* model_path, bool use_npu) {
         m->output_names.emplace_back(name ? name : "");
         if (name) ORT_OK(m->api->AllocatorFree(alloc, name));
     }
-    if (num_in < 1 || num_out != num_in) {
-        VLOGE("unexpected model signature: %zu inputs, %zu outputs", num_in, num_out);
+    const size_t want_in0 = m->split ? 2 * kBins * 3 : 2 * kHop;
+    if (num_in < 1 || num_out != num_in || m->in0_size != want_in0) {
+        VLOGE("unexpected model signature: %zu inputs, %zu outputs, input0 %zu", num_in, num_out, m->in0_size);
         delete m;
         return nullptr;
     }
-    VLOGI("StemgenRT session ready (npu=%d, %zu state tensors)", m->npu ? 1 : 0, m->state_sizes.size());
+    VLOGI("StemgenRT session ready (%s, npu=%d, %zu state tensors)", m->split ? "split" : "full",
+          m->npu ? 1 : 0, m->state_sizes.size());
     return m;
 }
 
@@ -265,6 +321,17 @@ struct PipelinedVocals::Impl {
     std::vector<OrtValue*> in_vals;
     std::vector<OrtValue*> out_vals;
 
+    // Split-model front/back end (worker thread only).
+    ally::RealFFT fft{kFft};
+    std::vector<float> history;                  // 2 * kHistory
+    std::vector<float> tail;                     // 2 * kHop
+    std::vector<float> frame;                    // kFft
+    std::vector<float> features;                 // [2][kBins][3]
+    std::vector<std::complex<float>> spectrum;   // [2][kBins]
+    std::vector<std::complex<float>> masked;     // kBins
+    std::vector<float> synth;                    // kFft
+    HopBuf vocals{};
+
     std::mutex mutex;
     std::condition_variable cv;
     bool stop = false;
@@ -289,6 +356,55 @@ struct PipelinedVocals::Impl {
     void reset_states() {
         for (auto& b : state_bufs) std::fill(b.begin(), b.end(), 0.0f);
         prev_in.fill(0.0f);
+        std::fill(history.begin(), history.end(), 0.0f);
+        std::fill(tail.begin(), tail.end(), 0.0f);
+    }
+
+    // Front end: windowed real FFT of [history | chunk] per channel, then the
+    // model's features [Re/s, Im/s, log(1 + |X|/s)] with s the RMS spectrum level.
+    void front_end(const float* in_audio) {
+        double power = 0.0;
+        for (int c = 0; c < 2; ++c) {
+            float* h = &history[c * kHistory];
+            for (int i = 0; i < kHistory; ++i) frame[i] = h[i] * m->analysis[i];
+            for (int i = 0; i < kHop; ++i) frame[kHistory + i] = in_audio[c * kHop + i] * m->analysis[kHistory + i];
+            std::complex<float>* X = &spectrum[c * kBins];
+            fft.forward(frame.data(), X);
+            for (int k = 0; k < kBins; ++k) power += std::norm(X[k]);
+            std::memmove(h, h + kHop, (kHistory - kHop) * sizeof(float));
+            std::memcpy(h + kHistory - kHop, &in_audio[c * kHop], kHop * sizeof(float));
+        }
+        const float mean = static_cast<float>(power / (2.0 * kBins));
+        const float inv = 1.0f / std::sqrt(std::max(mean, m->clip_min));
+        for (int c = 0; c < 2; ++c) {
+            const std::complex<float>* X = &spectrum[c * kBins];
+            float* f = &features[c * kBins * 3];
+            for (int k = 0; k < kBins; ++k) {
+                const float re = X[k].real(), im = X[k].imag();
+                f[3 * k + 0] = re * inv;
+                f[3 * k + 1] = im * inv;
+                f[3 * k + 2] = std::log1p(std::sqrt(re * re + im * im + m->eps_add) * inv);
+            }
+        }
+    }
+
+    // Back end: apply the complex mask, inverse FFT, synthesis window, overlap-add.
+    void back_end(const float* mask) {
+        for (int c = 0; c < 2; ++c) {
+            const std::complex<float>* X = &spectrum[c * kBins];
+            const float* mk = &mask[c * kBins * 2];
+            for (int k = 0; k < kBins; ++k) {
+                masked[k] = X[k] * std::complex<float>(mk[2 * k], mk[2 * k + 1]);
+            }
+            fft.inverse(masked.data(), synth.data());
+            float* t = &tail[c * kHop];
+            float* v = &vocals[c * kHop];
+            const float* seg = &synth[kFft - 2 * kHop];
+            for (int i = 0; i < kHop; ++i) {
+                v[i] = (seg[i] * m->synthesis[i] + t[i]) / m->denominator[i];
+                t[i] = seg[kHop + i] * m->synthesis[kHop + i];
+            }
+        }
     }
 
     bool run_model(const float* in_audio, float* out_dry, float* out_rest) {
@@ -301,10 +417,14 @@ struct PipelinedVocals::Impl {
             for (auto*& v : out_vals) { if (v) api->ReleaseValue(v); v = nullptr; }
         };
 
-        static const int64_t kAudioShape[3] = {1, 2, kHop};
+        const float* model_in = in_audio;
+        if (m->split) {
+            front_end(in_audio);
+            model_in = features.data();
+        }
         OrtStatus* st = api->CreateTensorWithDataAsOrtValue(
-            m->mem_info, const_cast<float*>(in_audio), 2 * kHop * sizeof(float),
-            kAudioShape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &in_vals[0]);
+            m->mem_info, const_cast<float*>(model_in), m->in0_size * sizeof(float),
+            m->in0_shape.data(), m->in0_shape.size(), ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &in_vals[0]);
         for (size_t i = 0; !st && i < n_states; ++i) {
             st = api->CreateTensorWithDataAsOrtValue(
                 m->mem_info, state_bufs[i].data(), state_bufs[i].size() * sizeof(float),
@@ -326,6 +446,10 @@ struct PipelinedVocals::Impl {
             api->ReleaseStatus(gs);
             release_all();
             return false;
+        }
+        if (m->split) {
+            back_end(vocals_data); // output 0 is the mask
+            vocals_data = vocals.data();
         }
         std::memcpy(out_dry, prev_in.data(), 2 * kHop * sizeof(float));
         std::memcpy(prev_in.data(), in_audio, 2 * kHop * sizeof(float));
@@ -425,6 +549,15 @@ void PipelinedVocals::load(bool use_npu) {
     auto* d = new Impl();
     d->m = m;
     for (size_t sz : m->state_sizes) d->state_bufs.emplace_back(sz, 0.0f);
+    if (m->split) {
+        d->history.assign(2 * kHistory, 0.0f);
+        d->tail.assign(2 * kHop, 0.0f);
+        d->frame.assign(kFft, 0.0f);
+        d->features.assign(2 * kBins * 3, 0.0f);
+        d->spectrum.assign(2 * kBins, {0.0f, 0.0f});
+        d->masked.assign(kBins, {0.0f, 0.0f});
+        d->synth.assign(kFft, 0.0f);
+    }
     for (const auto& n : m->input_names) d->in_names.push_back(n.c_str());
     for (const auto& n : m->output_names) d->out_names.push_back(n.c_str());
     d->fallback_buf.assign((1 + kMaxDelayHops) * 2 * kHop, 0.0f);

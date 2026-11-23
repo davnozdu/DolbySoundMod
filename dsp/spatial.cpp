@@ -22,20 +22,12 @@ constexpr float kSpeakerTrimSurround = 0.3981072f; // 10^(-8.0/20)
 
 #ifdef ALLY_ENABLE_NPU
 // /data/adb is 0700 root:root so audiohalservice (uid=audioserver) cannot traverse it.
-// post-fs-data.sh stages vocals.onnx into the already bind-mounted /vendor/lib64/soundfx
-// directory alongside liballysoundaidl.so and libonnxruntime.so.
+// post-fs-data.sh stages the model into the already bind-mounted /vendor/lib64/soundfx
+// directory alongside liballysoundaidl.so and libonnxruntime.so. The module ships the
+// split form (vocals_backbone.onnx + vocals_dsp.bin, see tools/make_cpu_model.py);
+// PipelinedVocals picks it up next to this path, a full vocals.onnx works as well.
 const char* vocals_model_path() {
-    static const char* cached = nullptr;
-    if (cached == nullptr) {
-        if (access("/vendor/lib64/soundfx/vocals.onnx", R_OK) == 0) {
-            cached = "/vendor/lib64/soundfx/vocals.onnx";
-        } else if (access("/vendor/etc/allysound/vocals.onnx", R_OK) == 0) {
-            cached = "/vendor/etc/allysound/vocals.onnx";
-        } else {
-            cached = "/data/adb/allysound/vocals.onnx";
-        }
-    }
-    return cached;
+    return "/vendor/lib64/soundfx/vocals.onnx";
 }
 // Podcast / audiobook model. A speech model can be dropped in as speech.onnx without
 // touching the code; until then the vocal separator does the job.

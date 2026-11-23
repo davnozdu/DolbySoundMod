@@ -108,11 +108,14 @@ stage_soundfx() {
     if [ -f "$MODDIR/vendor/lib64/libonnxruntime.so" ]; then
         cp -f "$MODDIR/vendor/lib64/libonnxruntime.so" "$STAGE/"
     fi
-    if [ -f "$MODDIR/vendor/etc/allysound/vocals.onnx" ]; then
-        cp -f "$MODDIR/vendor/etc/allysound/vocals.onnx" "$STAGE/vocals.onnx"
-        chmod 0644 "$STAGE/vocals.onnx"
-        chcon u:object_r:vendor_file:s0 "$STAGE/vocals.onnx" 2>/dev/null
-    fi
+    # Neural separator: backbone model + DSP parameters (tools/make_cpu_model.py).
+    for f in vocals_backbone.onnx vocals_dsp.bin; do
+        if [ -f "$MODDIR/vendor/etc/allysound/$f" ]; then
+            cp -f "$MODDIR/vendor/etc/allysound/$f" "$STAGE/$f"
+            chmod 0644 "$STAGE/$f"
+            chcon u:object_r:vendor_file:s0 "$STAGE/$f" 2>/dev/null
+        fi
+    done
     # Optional podcast model dropped in by the user; audioserver cannot read /data/adb.
     if [ -f "$DATA_DIR/speech.onnx" ]; then
         cp -f "$DATA_DIR/speech.onnx" "$STAGE/speech.onnx"
@@ -139,15 +142,10 @@ stage_soundfx() {
     return 0
 }
 
-# Model for the neural separator: audioserver must be able to read it.
+# Older versions copied the full model into /data/adb, which audioserver cannot read;
+# the separator is staged into soundfx above, so drop the 11 MB leftover.
 install_model() {
-    SRC="$MODDIR/vendor/etc/allysound/vocals.onnx"
-    DST="$DATA_DIR/vocals.onnx"
-    [ -f "$SRC" ] || return 0
-    cp -f "$SRC" "$DST" || return 0
-    chmod 0644 "$DST"
-    chcon u:object_r:vendor_configs_file:s0 "$DST" 2>/dev/null
-    log "model: $DST"
+    rm -f "$DATA_DIR/vocals.onnx"
 }
 
 if [ -f /odm/etc/audio_effects_config.xml ]; then
