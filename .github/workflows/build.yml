@@ -14,6 +14,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pinned: the model split is verified with onnx 1.17 / onnxruntime 1.20, whose
+      # wheels stop at Python 3.13; the runner's default Python is newer.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Set up Python & generate KU100 HRIR header
         run: |
           python3 -m pip install --quiet h5py numpy scipy
