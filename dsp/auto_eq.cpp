@@ -472,11 +472,13 @@ struct AutoEq::Impl {
 #endif
             count = candidate == vote ? std::min(count + 1, 2) : 1;
             vote = candidate;
-            if (count >= 2 || candidate == Eq::Error) {
+            // Music only counts once its genre has been checked in this probe: otherwise
+            // the first windows of every probe store plain "music" and flatten the
+            // genre curve for a few seconds every probe.
+            const bool musical = candidate >= Eq::Music && candidate < Eq::Error;
+            if ((count >= 2 && (!musical || genre_ran)) || candidate == Eq::Error) {
                 result.store((token << 8) | static_cast<uint64_t>(candidate), std::memory_order_relaxed);
-                // Stable. Music only counts once its genre has been checked this probe.
-                const bool musical = candidate >= Eq::Music && candidate < Eq::Error;
-                if (candidate != Eq::Error && (!musical || genre_ran)) {
+                if (candidate != Eq::Error) {
                     rest.store(kRestWindows, std::memory_order_relaxed);
                     music.clear();          // the next probe needs fresh, contiguous audio
                     genre_ran = false;
