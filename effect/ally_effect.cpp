@@ -174,6 +174,7 @@ public:
         renderer_.set_device(device_.load());
         renderer_.set_neural(neural_.load());
         renderer_.set_reverb(reverb_.load());
+        renderer_.set_upmix(upmix_.load());
 
         if (specific.has_value()) {
             apply_specific_locked(*specific);
@@ -319,6 +320,7 @@ private:
     std::atomic<ally::DeviceKind> device_{ally::DeviceKind::Headphones};
     std::atomic<bool> neural_{false};
     std::atomic<bool> reverb_{true};
+    std::atomic<bool> upmix_{false};
     std::atomic<bool> worker_running_{false};
     std::thread worker_;
 
@@ -346,6 +348,13 @@ private:
                 return;
             }
             int32_t val = le.get<LoudnessEnhancer::Tag::gainMb>();
+            if (val >= 30000 && val < 50000) {
+                // 30000 + upmix * 10000 + profile * 1000 + neural * 100 + reverb * 10 + device
+                const int up = (val - 30000) / 10000;
+                upmix_.store(up != 0);
+                renderer_.set_upmix(up != 0);
+                val = 20000 + (val - 30000) % 10000;
+            }
             if (val >= 20000 && val < 30000) {
                 // profile * 1000 + neural * 100 + reverb * 10 + device
                 const int rem = val - 20000;
@@ -367,7 +376,8 @@ private:
                     device_.store(dev);
                     renderer_.set_device(dev);
                 }
-                ALOGI("Updated params: profile=%d neural=%d reverb=%d device=%d", p, n, r, d);
+                ALOGI("Updated params: profile=%d neural=%d reverb=%d device=%d upmix=%d", p, n, r, d,
+                      (int)upmix_.load());
             } else if (val >= 10000 && val < 11000) {
                 // Older encoding without the reverb digit, kept so an app that still
                 // writes the four-digit code does not lose its settings.

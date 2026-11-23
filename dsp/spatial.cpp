@@ -43,6 +43,10 @@ const char* speech_model_path() {
 }
 #endif
 constexpr float kGlassesBassGain = 0.2589254f;     // 10^(2.0/20) - 1
+// The coherence upmix conserves energy, while the passive matrix adds extra side
+// copies; this makeup keeps the toggle loudness-matched (music, all presets and
+// devices within about +-1 dB).
+constexpr float kUpmixMakeup = 1.3182567f;  // 10^(2.4/20)
 
 struct ProfileParams {
     float dialogue;
@@ -519,6 +523,79 @@ void Dynamics::process(float* left, float* right, bool leveler, bool compress) {
     pending_ = incoming;
 }
 
+// --- CoherenceUpmix ---
+
+void CoherenceUpmix::init(float sample_rate) {
+    constexpr double kTwoPi = 2.0 * kPi;
+    window_.resize(kN);
+    for (int i = 0; i < kN; ++i) {
+        window_[i] = static_cast<float>(std::sqrt(0.5 - 0.5 * std::cos(kTwoPi * i / kN)));
+    }
+    // ~60 ms statistics: long enough for a stable coherence estimate, short enough
+    // to follow a mix.
+    alpha_ = std::exp(-static_cast<float>(kHop) / (sample_rate * 0.06f));
+    for (auto& h : history_) h.assign(kN, 0.0f);
+    for (auto& s : spec_) s.assign(kBins, {0.0f, 0.0f});
+    for (auto& s : out_spec_) s.assign(kBins, {0.0f, 0.0f});
+    for (auto& o : ola_) o.assign(kN, 0.0f);
+    frame_.assign(kN, 0.0f);
+    pll_.assign(kBins, 0.0f);
+    prr_.assign(kBins, 0.0f);
+    plr_.assign(kBins, {0.0f, 0.0f});
+}
+
+void CoherenceUpmix::reset() {
+    for (auto& h : history_) std::fill(h.begin(), h.end(), 0.0f);
+    for (auto& o : ola_) std::fill(o.begin(), o.end(), 0.0f);
+    std::fill(pll_.begin(), pll_.end(), 0.0f);
+    std::fill(prr_.begin(), prr_.end(), 0.0f);
+    std::fill(plr_.begin(), plr_.end(), std::complex<float>{0.0f, 0.0f});
+}
+
+void CoherenceUpmix::process(const float* l, const float* r, float* front_l, float* front_r,
+                             float* centre, float* amb_l, float* amb_r) {
+    const float* in[2] = {l, r};
+    for (int c = 0; c < 2; ++c) {
+        auto& h = history_[c];
+        std::memmove(h.data(), h.data() + kHop, (kN - kHop) * sizeof(float));
+        std::memcpy(h.data() + kN - kHop, in[c], kHop * sizeof(float));
+        for (int i = 0; i < kN; ++i) frame_[i] = h[i] * window_[i];
+        fft_.forward(frame_.data(), spec_[c].data());
+    }
+    const float a = alpha_;
+    for (int k = 0; k < kBins; ++k) {
+        const std::complex<float> L = spec_[0][k], R = spec_[1][k];
+        pll_[k] = a * pll_[k] + (1.0f - a) * std::norm(L);
+        prr_[k] = a * prr_[k] + (1.0f - a) * std::norm(R);
+        plr_[k] = a * plr_[k] + (1.0f - a) * (L * std::conj(R));
+        const float total = pll_[k] + prr_[k];
+        const float coherence = std::min(1.0f, std::abs(plr_[k]) / std::sqrt(pll_[k] * prr_[k] + 1e-24f));
+        const float pan = (pll_[k] - prr_[k]) / (total + 1e-24f);       // +1 left .. -1 right
+        const float centred = (1.0f - std::abs(pan)) * (1.0f - std::abs(pan));
+        // Content in one channel only has no coherence to measure yet is clearly a
+        // direct, panned source: only balanced, decorrelated energy counts as ambience.
+        const float ambient = (1.0f - coherence) * (1.0f - std::abs(pan));
+        const float direct = 1.0f - ambient;
+        const std::complex<float> dl = direct * L, dr = direct * R;
+        const std::complex<float> mid = 0.5f * centred * (dl + dr);
+        out_spec_[0][k] = dl - mid;
+        out_spec_[1][k] = dr - mid;
+        out_spec_[2][k] = mid;
+        out_spec_[3][k] = ambient * L;
+        out_spec_[4][k] = ambient * R;
+    }
+    float* outs[kOut] = {front_l, front_r, centre, amb_l, amb_r};
+    for (int o = 0; o < kOut; ++o) {
+        fft_.inverse(out_spec_[o].data(), frame_.data());
+        auto& acc = ola_[o];
+        // sqrt-Hann analysis x synthesis = Hann, which sums to 2 at 75% overlap.
+        for (int i = 0; i < kN; ++i) acc[i] += frame_[i] * window_[i] * 0.5f;
+        std::memcpy(outs[o], acc.data(), kHop * sizeof(float));
+        std::memmove(acc.data(), acc.data() + kHop, (kN - kHop) * sizeof(float));
+        std::fill(acc.end() - kHop, acc.end(), 0.0f);
+    }
+}
+
 // --- CrosstalkWidener ---
 
 void CrosstalkWidener::init(float sample_rate) {
@@ -590,6 +667,7 @@ void Renderer::init(float sample_rate) {
     speech_hp_.configure_highpass_2nd(95.0f, sample_rate, 2);
     speech_presence_.configure_high_shelf(2800.0f, 4.5f, sample_rate, 2);
     widener_.init(sample_rate);
+    upmix_.init(sample_rate);
     dynamics_.init(sample_rate);
 
     set_profile(profile_);
@@ -606,6 +684,7 @@ void Renderer::reset() {
     glasses_bass_.reset();
     cinema_air_.reset();
     widener_.reset();
+    upmix_.reset();
     dynamics_.reset();
     clock_ = 0.0;
     surround_seen_ = -1e9;
@@ -711,16 +790,29 @@ void Renderer::make_stereo_feeds(bool& has_lfe) {
     }
 #endif
 
-    for (int i = 0; i < kHop; ++i) {
-        float mid = 0.5f * (fl[i] + fr[i]);
-        float voice = 0.5f * mid;
-        float rest_l = fl[i] - voice;
-        float rest_r = fr[i] - voice;
-        feeds_[0 * kHop + i] = rest_l;
-        feeds_[1 * kHop + i] = rest_r;
-        feeds_[2 * kHop + i] = voice * cfg.dialogue;
-        amb[0 * kHop + i] = rest_l - 0.7f * rest_r;
-        amb[1 * kHop + i] = rest_r - 0.7f * rest_l;
+    if (upmix_on_) {
+        std::array<float, kHop> centre{};
+        upmix_.process(fl, fr, &feeds_[0 * kHop], &feeds_[1 * kHop], centre.data(),
+                       &amb[0 * kHop], &amb[1 * kHop]);
+        for (int i = 0; i < kHop; ++i) {
+            feeds_[0 * kHop + i] *= kUpmixMakeup;
+            feeds_[1 * kHop + i] *= kUpmixMakeup;
+            feeds_[2 * kHop + i] = centre[i] * kUpmixMakeup * cfg.dialogue;
+            amb[0 * kHop + i] *= kUpmixMakeup;
+            amb[1 * kHop + i] *= kUpmixMakeup;
+        }
+    } else {
+        for (int i = 0; i < kHop; ++i) {
+            float mid = 0.5f * (fl[i] + fr[i]);
+            float voice = 0.5f * mid;
+            float rest_l = fl[i] - voice;
+            float rest_r = fr[i] - voice;
+            feeds_[0 * kHop + i] = rest_l;
+            feeds_[1 * kHop + i] = rest_r;
+            feeds_[2 * kHop + i] = voice * cfg.dialogue;
+            amb[0 * kHop + i] = rest_l - 0.7f * rest_r;
+            amb[1 * kHop + i] = rest_r - 0.7f * rest_l;
+        }
     }
     ambience_delay_.process(amb.data(), rear.data(), kHop);
     for (int i = 0; i < kHop; ++i) {

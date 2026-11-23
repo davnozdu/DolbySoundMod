@@ -125,6 +125,40 @@ private:
     float compute_compressor(const float* left, const float* right, float gain_db);
 };
 
+// Coherence-based stereo upmix (primary/ambient decomposition in the STFT domain).
+//
+// Per frequency band the inter-channel coherence of the stereo pair splits it into a
+// correlated (direct) part and an uncorrelated (ambient) part; the two masks sum to
+// one, so direct + ambient reproduces the input exactly. The direct part is placed by
+// its level panning: centred content goes to the centre speaker, hard-panned content
+// stays on its own front speaker (the passive matrix leaks it, polarity-inverted, into
+// the opposite surrounds). The ambient part feeds the sides and rears.
+// STFT: 512-point sqrt-Hann, hop kHop (75% overlap), latency 384 samples (8 ms).
+class CoherenceUpmix {
+public:
+    static constexpr int kN = 4 * kHop;
+    static constexpr int kBins = kN / 2 + 1;
+
+    void init(float sample_rate);
+    void reset();
+    // l, r: one hop of input; outputs one hop each (delayed by kN - kHop samples).
+    void process(const float* l, const float* r, float* front_l, float* front_r,
+                 float* centre, float* amb_l, float* amb_r);
+
+private:
+    static constexpr int kOut = 5;  // front L/R, centre, ambient L/R
+    RealFFT fft_{kN};
+    float alpha_ = 0.9f;
+    std::vector<float> window_;                         // sqrt periodic Hann
+    std::array<std::vector<float>, 2> history_;         // kN per channel
+    std::array<std::vector<std::complex<float>>, 2> spec_;
+    std::array<std::vector<std::complex<float>>, kOut> out_spec_;
+    std::array<std::vector<float>, kOut> ola_;          // kN per output
+    std::vector<float> frame_;
+    std::vector<float> pll_, prr_;
+    std::vector<std::complex<float>> plr_;
+};
+
 class CrosstalkWidener {
 public:
     void init(float sample_rate);
@@ -147,6 +181,13 @@ public:
     void set_neural(bool enabled) { neural_ = enabled; }
     void set_reverb(bool enabled) { reverb_ = enabled; }
     void set_bypass(bool bypass) { bypass_ = bypass; }
+    // Coherence upmix instead of the passive matrix for stereo sources (neural
+    // separation, when active, keeps its own path).
+    void set_upmix(bool enabled) {
+        if (enabled && !upmix_on_) upmix_.reset();
+        upmix_on_ = enabled;
+    }
+    bool upmix() const { return upmix_on_; }
 
     Profile profile() const { return profile_; }
     DeviceKind device() const { return device_; }
@@ -179,6 +220,7 @@ private:
     DeviceKind device_ = DeviceKind::Headphones;
     bool reverb_ = true;
     bool bypass_ = false;
+    bool upmix_on_ = false;
     bool neural_ = false;
     uint64_t tick_ = 0;
 
@@ -199,6 +241,7 @@ private:
     BiquadFilter speaker_lfe_;
     BiquadFilter glasses_bass_;
     CrosstalkWidener widener_;
+    CoherenceUpmix upmix_;
     Dynamics dynamics_;
 
     double clock_ = 0.0;

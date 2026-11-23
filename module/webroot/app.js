@@ -3,6 +3,7 @@ const APPS_CONF = `${DATA_DIR}/apps.conf`;
 const DEVICE_CONF = `${DATA_DIR}/device.conf`;
 const NEURAL_CONF = `${DATA_DIR}/neural.conf`;
 const REVERB_CONF = `${DATA_DIR}/reverb.conf`;
+const UPMIX_CONF = `${DATA_DIR}/upmix.conf`;
 const AUTO_UPDATE_CONF = `${DATA_DIR}/auto_update.conf`;
 const STATUS_JSON = `${DATA_DIR}/status.json`;
 const MOD_DIR = '/data/adb/modules/allysound';
@@ -81,6 +82,8 @@ async function loadConfig() {
     document.getElementById('toggle-neural').checked = (neuralRaw === '1');
     const reverbRaw = (await execCmd(`cat "${REVERB_CONF}" 2>/dev/null || echo 0`)).trim();
     document.getElementById('toggle-reverb').checked = (reverbRaw === '1');
+    const upmixRaw = (await execCmd(`cat "${UPMIX_CONF}" 2>/dev/null || echo 0`)).trim();
+    document.getElementById('toggle-upmix').checked = (upmixRaw === '1');
     const autoUpdRaw = (await execCmd(`cat "${AUTO_UPDATE_CONF}" 2>/dev/null || echo 1`)).trim();
     document.getElementById('toggle-autoupdate').checked = (autoUpdRaw !== '0');
   } catch (e) {
@@ -277,6 +280,11 @@ document.getElementById('toggle-neural').onchange = async (e) => {
 document.getElementById('toggle-reverb').onchange = async (e) => {
   const v = e.target.checked ? '1' : '0';
   await execCmd(`mkdir -p "${DATA_DIR}" && echo "${v}" > "${REVERB_CONF}"`);
+};
+
+document.getElementById('toggle-upmix').onchange = async (e) => {
+  const v = e.target.checked ? '1' : '0';
+  await execCmd(`mkdir -p "${DATA_DIR}" && echo "${v}" > "${UPMIX_CONF}"`);
 };
 
 document.getElementById('toggle-autoupdate').onchange = async (e) => {
