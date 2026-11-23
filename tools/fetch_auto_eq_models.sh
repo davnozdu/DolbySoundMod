@@ -26,4 +26,6 @@ curl -fsSL --retry 3 -o "$temp/discogs-effnet-bsdynamic-1.onnx" \
     https://essentia.upf.edu/models/feature-extractors/discogs-effnet/discogs-effnet-bsdynamic-1.onnx
 verify a280825b334797cf677939db8cd5762c0392aedd0ca6415dbc1cd083f045e43c "$temp/discogs-effnet-bsdynamic-1.onnx"
 mkdir -p "$dest"
-cp "$temp/yamnet.onnx" "$temp/yamnet.data" "$temp/discogs-effnet-bsdynamic-1.onnx" "$dest/"
+# The HTP rejects the export's Identity (it only feeds the unused embeddings output).
+python3 "$(dirname "$0")/prepare_effnet.py" "$temp/discogs-effnet-bsdynamic-1.onnx" "$temp/discogs-effnet-htp.onnx"
+cp "$temp/yamnet.onnx" "$temp/yamnet.data" "$temp/discogs-effnet-htp.onnx" "$dest/"

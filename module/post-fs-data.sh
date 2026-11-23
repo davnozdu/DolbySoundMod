@@ -109,7 +109,7 @@ stage_soundfx() {
         cp -f "$MODDIR/vendor/lib64/libonnxruntime.so" "$STAGE/"
     fi
     # Stage the separator and auto EQ models next to the vendor effect library.
-    for f in vocals_backbone.onnx vocals_dsp.bin yamnet.onnx yamnet.data discogs-effnet-bsdynamic-1.onnx; do
+    for f in vocals_backbone.onnx vocals_dsp.bin yamnet.onnx yamnet.data discogs-effnet-htp.onnx; do
         if [ -f "$MODDIR/vendor/etc/allysound/$f" ]; then
             cp -f "$MODDIR/vendor/etc/allysound/$f" "$STAGE/$f"
             chmod 0644 "$STAGE/$f"

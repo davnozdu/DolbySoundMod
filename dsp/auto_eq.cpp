@@ -72,10 +72,9 @@ public:
     ~Models() {
         if (genre_) api_->ReleaseSession(genre_);
         if (audio_) api_->ReleaseSession(audio_);
-        if (qnn_audio_ || qnn_genre_) {
+        if (qnn_audio_) {
             const std::lock_guard<std::mutex> lock(qnn_mutex());
-            if (qnn_audio_) api_->ReleaseSession(qnn_audio_);
-            if (qnn_genre_) api_->ReleaseSession(qnn_genre_);
+            api_->ReleaseSession(qnn_audio_);
         }
         if (qnn_options_) api_->ReleaseSessionOptions(qnn_options_);
         if (memory_) api_->ReleaseMemoryInfo(memory_);
@@ -118,7 +117,10 @@ public:
                 ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input))) {
             return false;
         }
-        OrtSession* npu = genre ? genre_npu() : (qnn_healthy_ ? qnn_audio_ : nullptr);
+        // Genre stays on the CPU: measured on the phone, the fp16 HTP result ran up to
+        // 0.09 below the CPU's group scores (rock 0.20 -> 0.16 against a 0.15 threshold),
+        // while the model runs about once per 25 s, so the HTP would only cost accuracy.
+        OrtSession* npu = genre ? nullptr : (qnn_healthy_ ? qnn_audio_ : nullptr);
         bool done = false;
         if (npu) {
             // Another model holding the HTP is not worth waiting for: use the CPU.
@@ -128,24 +130,12 @@ public:
                 const bool ran = infer(npu, input_name, input, output_name, scores);
                 const float ms = std::chrono::duration<float, std::milli>(
                     std::chrono::steady_clock::now() - start).count();
-                const char* model = genre ? "Discogs-EffNet" : "YAMNet";
+                const char* model = "YAMNet";
                 if (!ran) {
                     // Background thread with seconds of slack: a slow run is fine, only a
                     // failure moves the model to the CPU for good.
-                    (genre ? genre_npu_state_ : qnn_state_) = -1;
-                    qnn_healthy_ = qnn_state_ >= 0;
+                    qnn_healthy_ = false;
                     log(ANDROID_LOG_WARN, "%s HTP failed after %.2f ms, using CPU", model, ms);
-                } else if (genre && genre_npu_state_ == 0) {
-                    // First genre pass: check the fp16 HTP result against the CPU once.
-                    std::array<float, N> reference{};
-                    done = infer(genre_, input_name, input, output_name, reference);
-                    float worst = 0.0f;
-                    for (size_t i = 0; done && i < N; ++i) worst = std::max(worst, std::abs(reference[i] - scores[i]));
-                    genre_npu_state_ = done && worst <= kNpuTolerance ? 1 : -1;
-                    log(genre_npu_state_ > 0 ? ANDROID_LOG_INFO : ANDROID_LOG_WARN,
-                        "Discogs-EffNet HTP %.2f ms, max style difference vs CPU %.4f: %s", ms, worst,
-                        genre_npu_state_ > 0 ? "using HTP" : "using CPU");
-                    if (done) scores = reference;
                 } else {
                     done = true;
                     log(ANDROID_LOG_DEBUG, "%s HTP %.2f ms", model, ms);
@@ -158,9 +148,6 @@ public:
     }
 
 private:
-    // fp16 on the HTP must stay this close to the CPU's sigmoid activations.
-    static constexpr float kNpuTolerance = 0.05f;
-
     __attribute__((format(printf, 2, 3)))
     static void log(int priority, const char* format, ...) {
 #ifdef __ANDROID__
@@ -173,39 +160,10 @@ private:
 #endif
     }
 
-    // The export has a dynamic batch; pin it to the three patches we always send.
+    // tools/prepare_effnet.py fixes the batch to kGenrePatches and drops the unused
+    // embeddings output, whose Identity the HTP rejects.
     bool open_genre() {
-        OrtSessionOptions* opt = nullptr;
-        if (!ok(api_->CloneSessionOptions(options_, &opt))) return false;
-        const bool ready = ok(api_->AddFreeDimensionOverrideByName(opt, "batch_size", kGenrePatches)) &&
-                           ok(api_->CreateSession(env_, ALLY_EQ_MODEL_DIR "discogs-effnet-bsdynamic-1.onnx",
-                                                  opt, &genre_));
-        api_->ReleaseSessionOptions(opt);
-        return ready;
-    }
-
-    // Discogs-EffNet on the HTP, created on the first genre pass so a stream without
-    // music never prepares its graph. Null when QNN is unavailable or was rejected.
-    OrtSession* genre_npu() {
-        if (!qnn_options_ || genre_npu_state_ < 0) return nullptr;
-        if (qnn_genre_) return qnn_genre_;
-        OrtSessionOptions* opt = nullptr;
-        const bool ready = ok(api_->CloneSessionOptions(qnn_options_, &opt)) &&
-                           ok(api_->AddFreeDimensionOverrideByName(opt, "batch_size", kGenrePatches)) &&
-                           with_qnn_library_path(ALLY_EQ_MODEL_DIR "ally-qnn/", [&] {
-                               return create_cached_qnn_session(
-                                   api_, env_, opt, ALLY_EQ_MODEL_DIR "discogs-effnet-bsdynamic-1.onnx",
-                                   "effnet_ctx.onnx", &qnn_genre_, [this](OrtStatus* st) { return ok(st); });
-                           });
-        if (opt) api_->ReleaseSessionOptions(opt);
-        if (!ready) {
-            qnn_genre_ = nullptr;
-            genre_npu_state_ = -1;
-            log(ANDROID_LOG_WARN, "Discogs-EffNet HTP unavailable, using CPU");
-            return nullptr;
-        }
-        log(ANDROID_LOG_INFO, "Discogs-EffNet HTP ready");
-        return qnn_genre_;
+        return ok(api_->CreateSession(env_, ALLY_EQ_MODEL_DIR "discogs-effnet-htp.onnx", options_, &genre_));
     }
 
     void enable_qnn() {
@@ -228,7 +186,9 @@ private:
                                              "yamnet_ctx.onnx", &qnn_audio_,
                                              [this](OrtStatus* st) { return ok(st); });
         });
-        qnn_state_ = qnn_healthy_ ? 1 : -1;
+        // Only YAMNet uses the HTP; its session keeps what it needs.
+        api_->ReleaseSessionOptions(qnn_options_);
+        qnn_options_ = nullptr;
         if (qnn_healthy_) log(ANDROID_LOG_INFO, "YAMNet HTP ready");
     }
 
@@ -263,11 +223,8 @@ private:
     OrtSession* audio_ = nullptr;
     OrtSession* genre_ = nullptr;
     OrtSession* qnn_audio_ = nullptr;
-    OrtSession* qnn_genre_ = nullptr;
     OrtSessionOptions* qnn_options_ = nullptr;   // CPU options plus the QNN provider
     bool qnn_healthy_ = false;
-    int qnn_state_ = 0;          // YAMNet on HTP: 1 ok, -1 failed
-    int genre_npu_state_ = 0;    // EffNet on HTP: 0 unverified, 1 verified, -1 rejected
     std::mutex mutex_;
 };
 

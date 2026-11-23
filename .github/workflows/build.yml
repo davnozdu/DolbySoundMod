@@ -261,7 +261,7 @@ jobs:
           cp build_arm64/libOplusAudioxAidl.so dist/module/vendor/lib64/soundfx/libOplusAudioxAidl.so
           cp onnxruntime/jni/arm64-v8a/libonnxruntime.so dist/module/vendor/lib64/libonnxruntime.so
           cp models/vocals_backbone.onnx models/vocals_dsp.bin dist/module/vendor/etc/allysound/
-          cp models/auto-eq/{yamnet.onnx,yamnet.data,discogs-effnet-bsdynamic-1.onnx} dist/module/vendor/etc/allysound/
+          cp models/auto-eq/{yamnet.onnx,yamnet.data,discogs-effnet-htp.onnx} dist/module/vendor/etc/allysound/
           cp -r models/ally-qnn dist/module/vendor/etc/allysound/
           cp onnxruntime/qnn/licenses/* dist/module/licenses/
           cp tools/train/WEIGHTS-LICENSE.md dist/module/licenses/StemgenRT-WEIGHTS-LICENSE.md
