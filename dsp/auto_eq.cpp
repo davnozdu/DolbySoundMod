@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +21,8 @@
 #include <android/log.h>
 #include <sched.h>
 #include <sys/resource.h>
+#else
+enum { ANDROID_LOG_DEBUG = 3, ANDROID_LOG_INFO = 4, ANDROID_LOG_WARN = 5 };
 #endif
 
 namespace ally {
@@ -69,10 +72,12 @@ public:
     ~Models() {
         if (genre_) api_->ReleaseSession(genre_);
         if (audio_) api_->ReleaseSession(audio_);
-        if (qnn_audio_) {
+        if (qnn_audio_ || qnn_genre_) {
             const std::lock_guard<std::mutex> lock(qnn_mutex());
-            api_->ReleaseSession(qnn_audio_);
+            if (qnn_audio_) api_->ReleaseSession(qnn_audio_);
+            if (qnn_genre_) api_->ReleaseSession(qnn_genre_);
         }
+        if (qnn_options_) api_->ReleaseSessionOptions(qnn_options_);
         if (memory_) api_->ReleaseMemoryInfo(memory_);
         if (options_) api_->ReleaseSessionOptions(options_);
         if (env_) api_->ReleaseEnv(env_);
@@ -104,52 +109,70 @@ public:
     bool run(bool genre, std::vector<float>& features, const int64_t (&shape)[D],
              std::array<float, N>& scores) {
         const std::lock_guard<std::mutex> lock(mutex_);
-        if (genre && !genre_ &&
-            !open_genre()) {
-            return false;
-        }
+        if (genre && !genre_ && !open_genre()) return false;
         const char* input_name = genre ? "melspectrogram" : "audio";
         const char* output_name = genre ? "activations" : "class_scores";
         OrtValue* input = nullptr;
-        OrtValue* output = nullptr;
-        bool success = ok(api_->CreateTensorWithDataAsOrtValue(
-            memory_, features.data(), features.size() * sizeof(float), shape, D,
-            ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input));
-        if (success) {
-            bool on_npu = false;
-            if (!genre && qnn_healthy_) {
-                std::unique_lock<std::mutex> qnn_lock(qnn_mutex(), std::try_to_lock);
-                if (qnn_lock) {
-                    const auto start = std::chrono::steady_clock::now();
-                    on_npu = infer(qnn_audio_, input_name, input, output_name, &output, scores);
-                    const auto ms = std::chrono::duration<float, std::milli>(
-                        std::chrono::steady_clock::now() - start).count();
-                    // Background thread with seconds of slack: a slow run (the first one
-                    // after the DSP wakes up is always slow) is fine; only a failure moves
-                    // YAMNet to the CPU for good.
-                    qnn_healthy_ = on_npu;
-#ifdef __ANDROID__
-                    if (!on_npu) {
-                        __android_log_print(ANDROID_LOG_WARN, "AllyAutoEq",
-                                            "YAMNet HTP failed after %.2f ms, using CPU", ms);
-                    } else {
-                        __android_log_print(ANDROID_LOG_DEBUG, "AllyAutoEq", "YAMNet HTP %.2f ms", ms);
-                    }
-#endif
-                    if (!on_npu && output) {
-                        api_->ReleaseValue(output);
-                        output = nullptr;
-                    }
+        if (!ok(api_->CreateTensorWithDataAsOrtValue(
+                memory_, features.data(), features.size() * sizeof(float), shape, D,
+                ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input))) {
+            return false;
+        }
+        OrtSession* npu = genre ? genre_npu() : (qnn_healthy_ ? qnn_audio_ : nullptr);
+        bool done = false;
+        if (npu) {
+            // Another model holding the HTP is not worth waiting for: use the CPU.
+            std::unique_lock<std::mutex> qnn_lock(qnn_mutex(), std::try_to_lock);
+            if (qnn_lock) {
+                const auto start = std::chrono::steady_clock::now();
+                const bool ran = infer(npu, input_name, input, output_name, scores);
+                const float ms = std::chrono::duration<float, std::milli>(
+                    std::chrono::steady_clock::now() - start).count();
+                const char* model = genre ? "Discogs-EffNet" : "YAMNet";
+                if (!ran) {
+                    // Background thread with seconds of slack: a slow run is fine, only a
+                    // failure moves the model to the CPU for good.
+                    (genre ? genre_npu_state_ : qnn_state_) = -1;
+                    qnn_healthy_ = qnn_state_ >= 0;
+                    log(ANDROID_LOG_WARN, "%s HTP failed after %.2f ms, using CPU", model, ms);
+                } else if (genre && genre_npu_state_ == 0) {
+                    // First genre pass: check the fp16 HTP result against the CPU once.
+                    std::array<float, N> reference{};
+                    done = infer(genre_, input_name, input, output_name, reference);
+                    float worst = 0.0f;
+                    for (size_t i = 0; done && i < N; ++i) worst = std::max(worst, std::abs(reference[i] - scores[i]));
+                    genre_npu_state_ = done && worst <= kNpuTolerance ? 1 : -1;
+                    log(genre_npu_state_ > 0 ? ANDROID_LOG_INFO : ANDROID_LOG_WARN,
+                        "Discogs-EffNet HTP %.2f ms, max style difference vs CPU %.4f: %s", ms, worst,
+                        genre_npu_state_ > 0 ? "using HTP" : "using CPU");
+                    if (done) scores = reference;
+                } else {
+                    done = true;
+                    log(ANDROID_LOG_DEBUG, "%s HTP %.2f ms", model, ms);
                 }
             }
-            success = on_npu || infer(genre ? genre_ : audio_, input_name, input, output_name, &output, scores);
         }
-        if (output) api_->ReleaseValue(output);
-        if (input) api_->ReleaseValue(input);
-        return success;
+        if (!done) done = infer(genre ? genre_ : audio_, input_name, input, output_name, scores);
+        api_->ReleaseValue(input);
+        return done;
     }
 
 private:
+    // fp16 on the HTP must stay this close to the CPU's sigmoid activations.
+    static constexpr float kNpuTolerance = 0.05f;
+
+    __attribute__((format(printf, 2, 3)))
+    static void log(int priority, const char* format, ...) {
+#ifdef __ANDROID__
+        va_list args;
+        va_start(args, format);
+        __android_log_vprint(priority, "AllyAutoEq", format, args);
+        va_end(args);
+#else
+        (void)priority, (void)format;
+#endif
+    }
+
     // The export has a dynamic batch; pin it to the three patches we always send.
     bool open_genre() {
         OrtSessionOptions* opt = nullptr;
@@ -161,33 +184,67 @@ private:
         return ready;
     }
 
-    void enable_qnn() {
+    // Discogs-EffNet on the HTP, created on the first genre pass so a stream without
+    // music never prepares its graph. Null when QNN is unavailable or was rejected.
+    OrtSession* genre_npu() {
+        if (!qnn_options_ || genre_npu_state_ < 0) return nullptr;
+        if (qnn_genre_) return qnn_genre_;
         OrtSessionOptions* opt = nullptr;
-        if (!ok(api_->CloneSessionOptions(options_, &opt))) return;
+        const bool ready = ok(api_->CloneSessionOptions(qnn_options_, &opt)) &&
+                           ok(api_->AddFreeDimensionOverrideByName(opt, "batch_size", kGenrePatches)) &&
+                           with_qnn_library_path(ALLY_EQ_MODEL_DIR "ally-qnn/", [&] {
+                               return create_cached_qnn_session(
+                                   api_, env_, opt, ALLY_EQ_MODEL_DIR "discogs-effnet-bsdynamic-1.onnx",
+                                   "effnet_ctx.onnx", &qnn_genre_, [this](OrtStatus* st) { return ok(st); });
+                           });
+        if (opt) api_->ReleaseSessionOptions(opt);
+        if (!ready) {
+            qnn_genre_ = nullptr;
+            genre_npu_state_ = -1;
+            log(ANDROID_LOG_WARN, "Discogs-EffNet HTP unavailable, using CPU");
+            return nullptr;
+        }
+        log(ANDROID_LOG_INFO, "Discogs-EffNet HTP ready");
+        return qnn_genre_;
+    }
+
+    void enable_qnn() {
+        if (!ok(api_->CloneSessionOptions(options_, &qnn_options_))) return;
         const char* keys[] = {"backend_path", "enable_htp_fp16_precision",
                               "htp_performance_mode", "qnn_context_priority"};
         const char* values[] = {ALLY_EQ_MODEL_DIR "ally-qnn/libQnnHtp.so", "1", kQnnBackgroundMode, "low"};
-        qnn_healthy_ = ok(api_->AddSessionConfigEntry(opt, "session.disable_cpu_ep_fallback", "1")) &&
-                       with_qnn_library_path(ALLY_EQ_MODEL_DIR "ally-qnn/", [&] {
-                           return ok(api_->SessionOptionsAppendExecutionProvider(opt, "QNN", keys, values, 4)) &&
-                                  create_cached_qnn_session(api_, env_, opt, ALLY_EQ_MODEL_DIR "yamnet.onnx",
-                                                            "yamnet_ctx.onnx", &qnn_audio_,
-                                                            [this](OrtStatus* st) { return ok(st); });
-                       });
-        api_->ReleaseSessionOptions(opt);
-#ifdef __ANDROID__
-        if (qnn_healthy_) __android_log_print(ANDROID_LOG_INFO, "AllyAutoEq", "YAMNet HTP ready");
-#endif
+        const bool provider = ok(api_->AddSessionConfigEntry(qnn_options_, "session.disable_cpu_ep_fallback", "1")) &&
+                              with_qnn_library_path(ALLY_EQ_MODEL_DIR "ally-qnn/", [&] {
+                                  return ok(api_->SessionOptionsAppendExecutionProvider(qnn_options_, "QNN", keys,
+                                                                                         values, 4));
+                              });
+        if (!provider) {
+            api_->ReleaseSessionOptions(qnn_options_);
+            qnn_options_ = nullptr;
+            return;
+        }
+        qnn_healthy_ = with_qnn_library_path(ALLY_EQ_MODEL_DIR "ally-qnn/", [&] {
+            return create_cached_qnn_session(api_, env_, qnn_options_, ALLY_EQ_MODEL_DIR "yamnet.onnx",
+                                             "yamnet_ctx.onnx", &qnn_audio_,
+                                             [this](OrtStatus* st) { return ok(st); });
+        });
+        qnn_state_ = qnn_healthy_ ? 1 : -1;
+        if (qnn_healthy_) log(ANDROID_LOG_INFO, "YAMNet HTP ready");
     }
 
     template <size_t N>
     bool infer(OrtSession* session, const char* input_name, OrtValue* input,
-               const char* output_name, OrtValue** output, std::array<float, N>& scores) {
+               const char* output_name, std::array<float, N>& scores) {
+        OrtValue* output = nullptr;
         float* data = nullptr;
-        if (!ok(api_->Run(session, nullptr, &input_name, &input, 1, &output_name, 1, output)) ||
-            !ok(api_->GetTensorMutableData(*output, reinterpret_cast<void**>(&data)))) return false;
-        std::copy_n(data, N, scores.begin());
-        return std::all_of(scores.begin(), scores.end(), [](float x) { return std::isfinite(x); });
+        bool done = ok(api_->Run(session, nullptr, &input_name, &input, 1, &output_name, 1, &output)) &&
+                    ok(api_->GetTensorMutableData(output, reinterpret_cast<void**>(&data)));
+        if (done) {
+            std::copy_n(data, N, scores.begin());
+            done = std::all_of(scores.begin(), scores.end(), [](float x) { return std::isfinite(x); });
+        }
+        if (output) api_->ReleaseValue(output);
+        return done;
     }
 
     bool ok(OrtStatus* status) const {
@@ -206,7 +263,11 @@ private:
     OrtSession* audio_ = nullptr;
     OrtSession* genre_ = nullptr;
     OrtSession* qnn_audio_ = nullptr;
+    OrtSession* qnn_genre_ = nullptr;
+    OrtSessionOptions* qnn_options_ = nullptr;   // CPU options plus the QNN provider
     bool qnn_healthy_ = false;
+    int qnn_state_ = 0;          // YAMNet on HTP: 1 ok, -1 failed
+    int genre_npu_state_ = 0;    // EffNet on HTP: 0 unverified, 1 verified, -1 rejected
     std::mutex mutex_;
 };
 
