@@ -42,8 +42,9 @@ const char* vocals_model_path() {
 const char* speech_model_path() {
     static const char* cached = nullptr;
     if (cached == nullptr) {
-        cached = (access("/data/adb/allysound/speech.onnx", R_OK) == 0)
-                     ? "/data/adb/allysound/speech.onnx"
+        // /data/adb is not traversable by audioserver, so only the staged copy counts.
+        cached = (access("/vendor/lib64/soundfx/speech.onnx", R_OK) == 0)
+                     ? "/vendor/lib64/soundfx/speech.onnx"
                      : vocals_model_path();
     }
     return cached;
@@ -63,7 +64,8 @@ struct ProfileParams {
 ProfileParams get_profile_params(Profile p) {
     switch (p) {
         case Profile::Movie:
-            return {1.2589254f, 0.16f, 0.40f, true, 0.48f, 0.42f};
+            // Same passive side/rear gains as the Ally plugin (spatial.py).
+            return {1.2589254f, 0.16f, 0.40f, true, 0.45f, 0.40f};
         case Profile::Music:
             return {1.0f, 0.08f, 0.25f, false, 0.38f, 0.32f};
         case Profile::Speech:
@@ -118,7 +120,8 @@ std::vector<float> generate_room_response(float rt60, float sample_rate, uint32_
 
     BiquadFilter low_f, air_f;
     low_f.configure_lowpass_2nd(2500.0f, sample_rate, 1);
-    air_f.configure_lowpass_2nd(9000.0f, sample_rate, 1);
+    // spatial.py: butter(1, 9000) - first order, a gentle top-end roll-off.
+    air_f.configure_lowpass_1st(9000.0f, sample_rate, 1);
 
     Rng rng(seed);
     std::vector<float> noise(length);
@@ -169,6 +172,22 @@ std::vector<float> generate_room_response(float rt60, float sample_rate, uint32_
         v /= norm;
     }
     return resp;
+}
+
+// acc += a * b over n complex bins. Written out by hand: std::complex<float>'s
+// operator* carries the C99 Annex G NaN/Inf recovery path (__mulsc3), which blocks
+// vectorisation and made the partitioned convolution twice as slow.
+inline void complex_mac(std::complex<float>* acc, const std::complex<float>* a,
+                        const std::complex<float>* b, size_t n) {
+    float* __restrict o = reinterpret_cast<float*>(acc);
+    const float* __restrict x = reinterpret_cast<const float*>(a);
+    const float* __restrict y = reinterpret_cast<const float*>(b);
+    for (size_t i = 0; i < n; ++i) {
+        const float xr = x[2 * i], xi = x[2 * i + 1];
+        const float yr = y[2 * i], yi = y[2 * i + 1];
+        o[2 * i] += xr * yr - xi * yi;
+        o[2 * i + 1] += xr * yi + xi * yr;
+    }
 }
 
 } // namespace
@@ -230,6 +249,16 @@ void BiquadFilter::configure_high_shelf(float freq_hz, float gain_db, float samp
     };
     channels_ = channels;
     order_ = 2;
+    state_.assign(channels_ * order_, 0.0f);
+}
+
+void BiquadFilter::configure_lowpass_1st(float cutoff_hz, float sample_rate, int channels) {
+    double k = std::tan(kPi * cutoff_hz / sample_rate);
+    double a0 = 1.0 + k;
+    b_ = {static_cast<float>(k / a0), static_cast<float>(k / a0)};
+    a_ = {1.0f, static_cast<float>((k - 1.0) / a0)};
+    channels_ = channels;
+    order_ = 1;
     state_.assign(channels_ * order_, 0.0f);
 }
 
@@ -359,10 +388,7 @@ void Convolver::process(const float* in, float* out) {
             for (int s = 0; s < sources_; ++s) {
                 const auto* h = &history_[(p * sources_ + s) * bins];
                 const auto* sp = &spectra_[((p * sources_ + s) * ears_ + 0) * bins];
-                auto* acc = &accum_[s * bins];
-                for (size_t b = 0; b < bins; ++b) {
-                    acc[b] += h[b] * sp[b];
-                }
+                complex_mac(&accum_[s * bins], h, sp, bins);
             }
         }
     } else {
@@ -371,10 +397,7 @@ void Convolver::process(const float* in, float* out) {
                 const auto* h = &history_[(p * sources_ + s) * bins];
                 for (int e = 0; e < ears_; ++e) {
                     const auto* sp = &spectra_[((p * sources_ + s) * ears_ + e) * bins];
-                    auto* acc = &accum_[e * bins];
-                    for (size_t b = 0; b < bins; ++b) {
-                        acc[b] += h[b] * sp[b];
-                    }
+                    complex_mac(&accum_[e * bins], h, sp, bins);
                 }
             }
         }
@@ -554,12 +577,15 @@ void Renderer::init(float sample_rate) {
     // Flatten kHrirKu100 [7][2][256]
     direct_.init(kNumSpeakers, 2, kHrirLength, &kHrirKu100[0][0][0], false);
 
-    room_game_ = generate_room_response(0.22f, sample_rate, 7);
-    room_movie_ = generate_room_response(0.40f, sample_rate, 7);
-    room_music_ = generate_room_response(0.25f, sample_rate, 7);
-
+    // Only the active preset's room is kept: the response is regenerated (a few ms)
+    // on a profile change instead of holding three of them in every instance.
     const int room_len = static_cast<int>(kRoomSeconds * sample_rate);
-    room_.init(2, 2, room_len, room_game_.data(), false);
+    room_rt60_ = get_profile_params(profile_).rt60;
+    if (room_rt60_ <= 0.0f) room_rt60_ = 0.22f;
+    {
+        const auto resp = generate_room_response(room_rt60_, sample_rate, 7);
+        room_.init(2, 2, room_len, resp.data(), false);
+    }
 
     ambience_delay_.init(2, static_cast<int>(kAmbienceDelaySec * sample_rate));
     speaker_delay_.init(1, static_cast<int>(0.012f * sample_rate));
@@ -599,19 +625,14 @@ void Renderer::reset() {
 
 void Renderer::set_profile(Profile p) {
     profile_ = p;
+    // Podcast has no room (rt60 0): keep whatever is loaded, it is never mixed in.
+    const float rt60 = get_profile_params(p).rt60;
+    if (rt60 <= 0.0f || rt60 == room_rt60_) return;
+    room_rt60_ = rt60;
     const int room_len = static_cast<int>(kRoomSeconds * sample_rate_);
-    switch (p) {
-        case Profile::Movie:
-            room_.set_responses(room_len, room_movie_.data());
-            break;
-        case Profile::Music:
-            room_.set_responses(room_len, room_music_.data());
-            break;
-        case Profile::Game:
-        default:
-            room_.set_responses(room_len, room_game_.data());
-            break;
-    }
+    const auto resp = generate_room_response(rt60, sample_rate_, 7);
+    room_.set_responses(room_len, resp.data());
+    room_.reset();
 }
 
 void Renderer::set_device(DeviceKind d) {
@@ -756,7 +777,7 @@ void Renderer::render_headphones(bool has_lfe, float* out_l, float* out_r) {
     const auto cfg = get_profile_params(profile_);
     direct_.process(feeds_.data(), ears_.data());
 
-    if (reverb_) {
+    if (reverb_ && cfg.room > 0.0f) {
         for (int i = 0; i < kHop; ++i) {
             room_send_[0 * kHop + i] = 0.5f * (feeds_[0 * kHop + i] + 0.7f * feeds_[2 * kHop + i] + feeds_[5 * kHop + i] + feeds_[3 * kHop + i]);
             room_send_[1 * kHop + i] = 0.5f * (feeds_[1 * kHop + i] + 0.7f * feeds_[2 * kHop + i] + feeds_[6 * kHop + i] + feeds_[4 * kHop + i]);
@@ -810,7 +831,7 @@ void Renderer::render_speakers(bool has_lfe, float* out_l, float* out_r) {
         out_r[i] = feeds_[1 * kHop + i] + voice + lt - s_side;
     }
     widener_.process(out_l, out_r);
-    if (reverb_) {
+    if (reverb_ && cfg.room > 0.0f) {
         for (int i = 0; i < kHop; ++i) {
             room_send_[i] = out_l[i] * 0.5f;
             room_send_[kHop + i] = out_r[i] * 0.5f;
@@ -896,6 +917,11 @@ void Renderer::process_interleaved(const float* in, float* out, int frames, int 
         std::memcpy(out, in, static_cast<size_t>(frames) * 2 * sizeof(float));
         return;
     }
+#ifdef ALLY_ENABLE_NPU
+    if (neural_) {
+        vocals_.note_block_frames(frames);
+    }
+#endif
 
     for (int i = 0; i < frames; ++i) {
         const float* src = in + i * in_channels;

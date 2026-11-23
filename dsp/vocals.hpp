@@ -5,18 +5,27 @@
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
 namespace ally {
 
-// Asynchronous StemgenRT (vocals.onnx) vocal separator with NNAPI (NPU) support.
+// Asynchronous StemgenRT (vocals.onnx) vocal separator with optional NNAPI (NPU) support.
 // Uses dlopen("libonnxruntime.so") at runtime so the base DSP has zero hard
 // dependency on ONNX Runtime when the neural toggle is off.
 class PipelinedVocals {
 public:
     static constexpr int kHop = 128;
-    static constexpr int kBufferHops = 10;
+    // The pipeline delay has to cover a whole block that AudioFlinger hands over at
+    // once (1920 frames = 15 hops on a deep buffer) plus time for the worker to
+    // chew through it. It grows to fit the largest block seen, up to kMaxDelayHops.
+    static constexpr int kMinDelayHops = 8;
+    static constexpr int kMarginHops = 6;
+    static constexpr int kMaxDelayHops = 64;
+    // After an underrun stay on the passive matrix for this long before fading the
+    // model back in, so a borderline-slow device does not toggle at the block rate.
+    static constexpr int kMissCooldownHops = 188; // ~0.5 s at 48 kHz
 
     PipelinedVocals() = default;
     ~PipelinedVocals();
@@ -24,10 +33,15 @@ public:
     PipelinedVocals(const PipelinedVocals&) = delete;
     PipelinedVocals& operator=(const PipelinedVocals&) = delete;
 
-    // Lazy init: loads libonnxruntime.so and vocals.onnx. Returns true if ready.
+    // Non-blocking lazy init: the first call starts loading libonnxruntime.so and the
+    // model on a background thread and returns false; it returns true once ready.
     bool ensure_loaded(const char* model_path, bool use_npu = true);
     bool is_ready() const { return ready_.load(); }
     bool using_npu() const { return npu_active_.load(); }
+
+    // Tells the pipeline how many frames the host delivers per call so the delay
+    // can cover a whole block. Call from the audio thread before process().
+    void note_block_frames(int frames);
 
     // Non-blocking process: feeds one stereo hop (planar: 2 * kHop) and outputs
     // time-aligned dry (2 * kHop) and rest = dry - vocals (2 * kHop).
@@ -39,8 +53,16 @@ private:
     Impl* impl_ = nullptr;
     std::atomic<bool> ready_{false};
     std::atomic<bool> failed_{false};
+    std::atomic<bool> loading_{false};
     std::atomic<bool> npu_active_{false};
+    std::thread loader_;
+    std::string model_path_;
 
+    // Audio-thread only.
+    int delay_hops_ = kMinDelayHops;
+    bool delay_changed_ = false;
+
+    void load(bool use_npu);
     void worker_loop();
     static void passive_matrix(const float* dry, float* rest);
 };

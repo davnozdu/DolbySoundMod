@@ -421,6 +421,8 @@ private:
         std::vector<float> in_buf;
         std::vector<float> stereo_buf;
         std::vector<float> out_buf;
+        std::vector<float> mono_buf;
+        auto last_beat = std::chrono::steady_clock::now();
 
         uint64_t stat_buffers = 0, stat_timeouts = 0, stat_wait_us = 0, stat_proc_us = 0;
         int idle_rounds_ = 0;
@@ -444,7 +446,6 @@ private:
             auto t_proc0 = std::chrono::steady_clock::now();
             if (!worker_running_.load()) break;
 
-            static auto last_beat = std::chrono::steady_clock::now();
             auto now_beat = std::chrono::steady_clock::now();
             if (std::chrono::duration_cast<std::chrono::milliseconds>(now_beat - last_beat).count() >= 2000) {
                 ALOGI("effect beat: avail_in=%d avail_out=%d frame_count=%zu state=%d",
@@ -475,12 +476,12 @@ private:
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (in_channels_ == 1) {
                     // Mono -> duplicate to stereo for renderer
-                    std::vector<float> st_in(frames * 2);
+                    mono_buf.resize(frames * 2);
                     for (size_t i = 0; i < frames; ++i) {
-                        st_in[2 * i] = in_buf[i];
-                        st_in[2 * i + 1] = in_buf[i];
+                        mono_buf[2 * i] = in_buf[i];
+                        mono_buf[2 * i + 1] = in_buf[i];
                     }
-                    renderer_.process_interleaved(st_in.data(), stereo_buf.data(), static_cast<int>(frames), 2);
+                    renderer_.process_interleaved(mono_buf.data(), stereo_buf.data(), static_cast<int>(frames), 2);
                 } else {
                     renderer_.process_interleaved(in_buf.data(), stereo_buf.data(), static_cast<int>(frames), in_channels_);
                 }

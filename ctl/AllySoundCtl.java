@@ -122,37 +122,46 @@ public class AllySoundCtl {
 
     private static int detectOutputDevice(String mode) {
         if (!"auto".equals(mode)) return parseDevice(mode);
+        // Use the route of STREAM_MUSIC ("- STREAM_MUSIC:" ... "Devices: speaker(2)").
+        // Scanning the whole dump for "a2dp" matched Bluetooth history lines
+        // ("A2DP device ... made unavailable") and put the headphone HRTF on the
+        // phone speaker.
+        String route = null;
+        boolean sawGlasses = false;
+        Process p = null;
         try {
-            Process p = Runtime.getRuntime().exec(new String[]{"dumpsys", "audio"});
+            p = Runtime.getRuntime().exec(new String[]{"dumpsys", "audio"});
             BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()));
             String line;
-            boolean inMedia = false;
-            int detected = 1; // default speakers
+            boolean inMusic = false;
             while ((line = br.readLine()) != null) {
                 String low = line.toLowerCase();
-                if (low.contains("stream_music") || low.contains("devices for strategy")) {
-                    inMedia = true;
+                if (low.contains("xreal") || low.contains("nreal") || low.contains("viture") || low.contains("rokid")) {
+                    sawGlasses = true;
                 }
-                if (inMedia) {
-                    if (low.contains("xreal") || low.contains("nreal") || low.contains("viture") || low.contains("rokid")) {
-                        detected = 2; // glasses
-                        break;
-                    }
-                    if (low.contains("a2dp") || low.contains("ble_headset") || low.contains("wired_head") ||
-                        low.contains("usb_headset") || low.contains("hearing_aid")) {
-                        detected = 0; // headphones
-                        break;
-                    }
-                    if (low.contains("speaker")) {
-                        detected = 1; // speakers
-                    }
+                if (low.trim().startsWith("- stream_music:")) {
+                    inMusic = true;
+                    continue;
+                }
+                if (inMusic && route == null && low.trim().startsWith("devices:")) {
+                    route = low.trim().substring("devices:".length()).trim();
+                    inMusic = false;
                 }
             }
-            p.destroy();  // never waitFor() after an early break: dumpsys keeps
-            return detected;  // writing into the pipe and waitFor() deadlocks
         } catch (Exception e) {
+            return 1;
+        } finally {
+            if (p != null) p.destroy();
+        }
+        if (route == null || route.isEmpty()) return 1; // unknown: phone speaker is the safe guess
+        if (route.contains("a2dp") || route.contains("bt_sco") || route.contains("ble_headset") ||
+            route.contains("ble_broadcast") || route.contains("headset") || route.contains("headphone") ||
+            route.contains("hearing_aid")) {
             return 0;
         }
+        if ((route.contains("usb") || route.contains("hdmi")) && sawGlasses) return 2;
+        if (route.contains("usb")) return 0; // USB DAC / dongle
+        return 1; // speaker, earpiece, anything else
     }
 
     private static int intAfter(String line, String key) {

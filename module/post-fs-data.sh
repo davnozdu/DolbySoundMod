@@ -113,6 +113,12 @@ stage_soundfx() {
         chmod 0644 "$STAGE/vocals.onnx"
         chcon u:object_r:vendor_file:s0 "$STAGE/vocals.onnx" 2>/dev/null
     fi
+    # Optional podcast model dropped in by the user; audioserver cannot read /data/adb.
+    if [ -f "$DATA_DIR/speech.onnx" ]; then
+        cp -f "$DATA_DIR/speech.onnx" "$STAGE/speech.onnx"
+        chmod 0644 "$STAGE/speech.onnx"
+        chcon u:object_r:vendor_file:s0 "$STAGE/speech.onnx" 2>/dev/null
+    fi
     chcon u:object_r:vendor_file:s0 "$STAGE/liballysoundaidl.so" 2>/dev/null
     if [ -f "$STAGE/libonnxruntime.so" ]; then
         chcon u:object_r:vendor_file:s0 "$STAGE/libonnxruntime.so" 2>/dev/null

@@ -35,6 +35,7 @@ public:
     void configure_lowpass_2nd(float cutoff_hz, float sample_rate, int channels);
     void configure_highpass_2nd(float cutoff_hz, float sample_rate, int channels);
     void configure_highpass_1st(float cutoff_hz, float sample_rate, int channels);
+    void configure_lowpass_1st(float cutoff_hz, float sample_rate, int channels);
     void configure_bandpass_crosstalk(float sample_rate);
     void configure_high_shelf(float freq_hz, float gain_db, float sample_rate, int channels);
     void reset();
@@ -181,9 +182,7 @@ private:
 
     Convolver direct_;
     Convolver room_;
-    std::vector<float> room_game_;
-    std::vector<float> room_movie_;
-    std::vector<float> room_music_;
+    float room_rt60_ = 0.0f; // rt60 of the response currently loaded into room_
 
     DelayLine ambience_delay_;
     DelayLine speaker_delay_;

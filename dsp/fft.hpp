@@ -19,6 +19,7 @@ public:
             double rangle = -2.0 * kPi * static_cast<double>(k) / static_cast<double>(n_);
             rfft_twiddles_[k] = {static_cast<float>(std::cos(rangle)), static_cast<float>(std::sin(rangle))};
         }
+        scratch_.resize(half_);
         // Precompute half-size complex FFT twiddles
         half_twiddles_.resize(half_ / 2);
         for (size_t k = 0; k < half_ / 2; ++k) {
@@ -32,7 +33,7 @@ public:
 
     // Forward real FFT: in[n] -> out[n/2 + 1]
     void forward(const float* in, std::complex<float>* out) const {
-        std::vector<std::complex<float>> buf(half_);
+        auto& buf = scratch_; // preallocated: no heap traffic on the audio thread
         for (size_t i = 0; i < half_; ++i) {
             buf[i] = {in[2 * i], in[2 * i + 1]};
         }
@@ -53,7 +54,7 @@ public:
 
     // Inverse real FFT: in[n/2 + 1] -> out[n] (scaled by 1/n, matching numpy.fft.irfft)
     void inverse(const std::complex<float>* in, float* out) const {
-        std::vector<std::complex<float>> buf(half_);
+        auto& buf = scratch_; // preallocated: no heap traffic on the audio thread
         const float x0 = in[0].real();
         const float xn = in[half_].real();
         buf[0] = {0.5f * (x0 + xn), 0.5f * (x0 - xn)};
@@ -111,6 +112,9 @@ private:
     std::vector<std::complex<float>> twiddles_;
     std::vector<std::complex<float>> rfft_twiddles_;
     std::vector<std::complex<float>> half_twiddles_;
+    // Scratch for forward()/inverse(). Each Convolver owns its RealFFT and calls it
+    // from one thread at a time, so a shared mutable buffer is safe.
+    mutable std::vector<std::complex<float>> scratch_;
 };
 
 } // namespace ally

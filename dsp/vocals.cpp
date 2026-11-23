@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -23,34 +24,246 @@ namespace ally {
 
 namespace {
 
+constexpr int kHop = PipelinedVocals::kHop;
+using HopBuf = std::array<float, 2 * kHop>;
+
 struct QueuedHop {
     uint64_t gen;
     uint64_t seq;
-    std::vector<float> audio; // 2 * kHop
+    HopBuf audio;
 };
 
 struct OutHop {
     uint64_t gen;
     uint64_t seq;
-    std::vector<float> dry;  // 2 * kHop
-    std::vector<float> rest; // 2 * kHop
+    HopBuf dry;
+    HopBuf rest;
 };
 
-} // namespace
+// NNAPI without a vendor driver only has "nnapi-reference": a slow CPU emulation
+// that, with relaxed fp16, adds audible noise to the recurrent state. Only hand the
+// model to NNAPI when a real accelerator is registered.
+bool has_nnapi_accelerator() {
+    void* nn = dlopen("libneuralnetworks.so", RTLD_NOW | RTLD_LOCAL);
+    if (nn == nullptr) {
+        VLOGI("libneuralnetworks.so unavailable: %s", dlerror());
+        return false;
+    }
+    using CountFn = int (*)(uint32_t*);
+    using GetFn = int (*)(uint32_t, void**);
+    using NameFn = int (*)(const void*, const char**);
+    using TypeFn = int (*)(const void*, int32_t*);
+    auto count_fn = reinterpret_cast<CountFn>(dlsym(nn, "ANeuralNetworks_getDeviceCount"));
+    auto get_fn = reinterpret_cast<GetFn>(dlsym(nn, "ANeuralNetworks_getDevice"));
+    auto name_fn = reinterpret_cast<NameFn>(dlsym(nn, "ANeuralNetworksDevice_getName"));
+    auto type_fn = reinterpret_cast<TypeFn>(dlsym(nn, "ANeuralNetworksDevice_getType"));
+    bool found = false;
+    uint32_t count = 0;
+    if (count_fn && get_fn && name_fn && type_fn && count_fn(&count) == 0) {
+        for (uint32_t i = 0; i < count; ++i) {
+            void* dev = nullptr;
+            const char* name = "?";
+            int32_t type = 0;
+            if (get_fn(i, &dev) != 0 || dev == nullptr) continue;
+            name_fn(dev, &name);
+            type_fn(dev, &type);
+            // ANEURALNETWORKS_DEVICE_CPU == 2
+            const bool real = type != 2 && std::strcmp(name, "nnapi-reference") != 0;
+            VLOGI("NNAPI device %u: %s type=%d%s", i, name, type, real ? " (accelerator)" : "");
+            found = found || real;
+        }
+    }
+    dlclose(nn);
+    return found;
+}
 
-struct PipelinedVocals::Impl {
-    void* ort_lib = nullptr;
+// One ONNX Runtime + one compiled session for the whole process. Every effect
+// instance (one per app session) only owns its recurrent state; OrtSession::Run is
+// thread-safe, so instances share the ~30 MB of runtime, weights and graph.
+struct SharedModel {
+    void* lib = nullptr;
     const OrtApi* api = nullptr;
     OrtEnv* env = nullptr;
     OrtSessionOptions* opts = nullptr;
     OrtSession* session = nullptr;
     OrtMemoryInfo* mem_info = nullptr;
-
     std::vector<std::string> input_names;
     std::vector<std::string> output_names;
     std::vector<std::vector<int64_t>> state_shapes;
+    std::vector<size_t> state_sizes;
+    bool npu = false;
+    int refs = 0;
+
+    ~SharedModel() {
+        if (api) {
+            if (session) api->ReleaseSession(session);
+            if (opts) api->ReleaseSessionOptions(opts);
+            if (mem_info) api->ReleaseMemoryInfo(mem_info);
+            if (env) api->ReleaseEnv(env);
+        }
+        if (lib) dlclose(lib);
+    }
+};
+
+std::mutex g_model_mutex;
+SharedModel* g_model = nullptr;
+
+#define ORT_OK(expr) (([&]() { OrtStatus* _s = (expr); if (_s) { VLOGE("%s: %s", #expr, m->api->GetErrorMessage(_s)); m->api->ReleaseStatus(_s); return false; } return true; })())
+
+SharedModel* load_model(const char* model_path, bool use_npu) {
+    auto* m = new SharedModel();
+    static const char* kOrtCandidates[] = {
+        "libonnxruntime.so",
+        "/vendor/lib64/soundfx/libonnxruntime.so",
+        "/vendor/lib64/libonnxruntime.so",
+    };
+    for (const char* cand : kOrtCandidates) {
+        m->lib = dlopen(cand, RTLD_NOW | RTLD_LOCAL);
+        if (m->lib) {
+            VLOGI("onnxruntime loaded: %s", cand);
+            break;
+        }
+        VLOGE("dlopen %s failed: %s", cand, dlerror());
+    }
+    if (!m->lib) { delete m; return nullptr; }
+
+    using GetApiBaseFn = const OrtApiBase* (*)();
+    auto get_base = reinterpret_cast<GetApiBaseFn>(dlsym(m->lib, "OrtGetApiBase"));
+    if (!get_base || !(m->api = get_base()->GetApi(ORT_API_VERSION))) {
+        VLOGE("OrtApi %d unavailable", ORT_API_VERSION);
+        delete m;
+        return nullptr;
+    }
+    if (!ORT_OK(m->api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "AllySound", &m->env))) {
+        delete m;
+        return nullptr;
+    }
+
+    auto create_session = [&](bool try_npu) -> bool {
+        if (m->opts) { m->api->ReleaseSessionOptions(m->opts); m->opts = nullptr; }
+        if (!ORT_OK(m->api->CreateSessionOptions(&m->opts))) return false;
+        // One hop is 128 samples: a thread pool costs more than it saves, spinning
+        // pool threads burn a core, and the arena keeps peak buffers forever.
+        ORT_OK(m->api->SetIntraOpNumThreads(m->opts, 1));
+        ORT_OK(m->api->SetInterOpNumThreads(m->opts, 1));
+        ORT_OK(m->api->DisableCpuMemArena(m->opts));
+        ORT_OK(m->api->AddSessionConfigEntry(m->opts, "session.intra_op.allow_spinning", "0"));
+        ORT_OK(m->api->AddSessionConfigEntry(m->opts, "session.inter_op.allow_spinning", "0"));
+        ORT_OK(m->api->SetSessionGraphOptimizationLevel(m->opts, ORT_ENABLE_ALL));
+        m->npu = false;
+        if (try_npu) {
+            using NnapiFn = OrtStatus* (*)(OrtSessionOptions*, uint32_t);
+            auto append_nnapi = reinterpret_cast<NnapiFn>(
+                dlsym(m->lib, "OrtSessionOptionsAppendExecutionProvider_Nnapi"));
+            // fp32 on purpose: relaxed fp16 drifts the recurrent state and is heard as
+            // hiss. CPU_DISABLED keeps NNAPI off its reference CPU emulation; whatever
+            // the accelerator cannot take (DFT, ...) runs on the ORT CPU EP.
+            if (append_nnapi) {
+                OrtStatus* nst = append_nnapi(m->opts, NNAPI_FLAG_CPU_DISABLED);
+                if (!nst) {
+                    m->npu = true;
+                } else {
+                    VLOGI("NNAPI EP unavailable (%s), using CPU", m->api->GetErrorMessage(nst));
+                    m->api->ReleaseStatus(nst);
+                }
+            }
+        }
+        if (!ORT_OK(m->api->CreateSession(m->env, model_path, m->opts, &m->session))) {
+            m->session = nullptr;
+            m->npu = false;
+            return false;
+        }
+        return true;
+    };
+
+    const bool try_npu = use_npu && has_nnapi_accelerator();
+    if (use_npu && !try_npu) {
+        VLOGI("no NNAPI accelerator registered, running the separator on CPU");
+    }
+    if (!(try_npu && create_session(true)) && !create_session(false)) {
+        delete m;
+        return nullptr;
+    }
+    // The session keeps what it needs; the options are no longer used.
+    m->api->ReleaseSessionOptions(m->opts);
+    m->opts = nullptr;
+
+    ORT_OK(m->api->CreateCpuMemoryInfo(OrtDeviceAllocator, OrtMemTypeDefault, &m->mem_info));
+
+    OrtAllocator* alloc = nullptr;
+    ORT_OK(m->api->GetAllocatorWithDefaultOptions(&alloc));
+    size_t num_in = 0, num_out = 0;
+    ORT_OK(m->api->SessionGetInputCount(m->session, &num_in));
+    ORT_OK(m->api->SessionGetOutputCount(m->session, &num_out));
+    for (size_t i = 0; i < num_in; ++i) {
+        char* name = nullptr;
+        ORT_OK(m->api->SessionGetInputName(m->session, i, alloc, &name));
+        m->input_names.emplace_back(name ? name : "");
+        if (name) ORT_OK(m->api->AllocatorFree(alloc, name));
+        if (i == 0) continue;
+        OrtTypeInfo* ti = nullptr;
+        const OrtTensorTypeAndShapeInfo* si = nullptr;
+        size_t dims = 0;
+        ORT_OK(m->api->SessionGetInputTypeInfo(m->session, i, &ti));
+        ORT_OK(m->api->CastTypeInfoToTensorInfo(ti, &si));
+        ORT_OK(m->api->GetDimensionsCount(si, &dims));
+        std::vector<int64_t> shape(dims);
+        ORT_OK(m->api->GetDimensions(si, shape.data(), dims));
+        size_t total = 1;
+        for (auto& dim : shape) {
+            if (dim <= 0) dim = 1;
+            total *= static_cast<size_t>(dim);
+        }
+        m->state_shapes.push_back(std::move(shape));
+        m->state_sizes.push_back(total);
+        m->api->ReleaseTypeInfo(ti);
+    }
+    for (size_t i = 0; i < num_out; ++i) {
+        char* name = nullptr;
+        ORT_OK(m->api->SessionGetOutputName(m->session, i, alloc, &name));
+        m->output_names.emplace_back(name ? name : "");
+        if (name) ORT_OK(m->api->AllocatorFree(alloc, name));
+    }
+    if (num_in < 1 || num_out != num_in) {
+        VLOGE("unexpected model signature: %zu inputs, %zu outputs", num_in, num_out);
+        delete m;
+        return nullptr;
+    }
+    VLOGI("StemgenRT session ready (npu=%d, %zu state tensors)", m->npu ? 1 : 0, m->state_sizes.size());
+    return m;
+}
+
+SharedModel* acquire_model(const char* model_path, bool use_npu) {
+    std::lock_guard<std::mutex> lock(g_model_mutex);
+    if (g_model == nullptr) {
+        g_model = load_model(model_path, use_npu);
+        if (g_model == nullptr) return nullptr;
+    }
+    g_model->refs++;
+    return g_model;
+}
+
+void release_model(SharedModel* m) {
+    if (m == nullptr) return;
+    std::lock_guard<std::mutex> lock(g_model_mutex);
+    if (--m->refs == 0) {
+        if (g_model == m) g_model = nullptr;
+        delete m;
+    }
+}
+
+} // namespace
+
+struct PipelinedVocals::Impl {
+    SharedModel* m = nullptr;
+
+    // Per-instance recurrent state; only the worker thread touches it.
     std::vector<std::vector<float>> state_bufs;
-    std::vector<float> prev_in; // 2 * kHop
+    HopBuf prev_in{};
+    std::vector<const char*> in_names;
+    std::vector<const char*> out_names;
+    std::vector<OrtValue*> in_vals;
+    std::vector<OrtValue*> out_vals;
 
     std::mutex mutex;
     std::condition_variable cv;
@@ -62,89 +275,89 @@ struct PipelinedVocals::Impl {
     uint64_t gen = 0;
     uint64_t seq = 0;
     uint64_t last_tick = UINT64_MAX;
-    float wet = 1.0f;
 
-    // Fallback delay line for (1 + kBufferHops) hops
-    std::vector<float> fallback_buf;
+    // Audio-thread only.
+    float wet = 0.0f;
+    int cooldown = 0;
+    std::vector<float> fallback_buf; // (1 + kMaxDelayHops) * 2 * kHop
     size_t fallback_pos = 0;
 
+    std::atomic<uint32_t> stat_hops{0};
+    std::atomic<uint32_t> stat_misses{0};
+    std::atomic<uint32_t> stat_resets{0};
+
     void reset_states() {
-        for (auto& b : state_bufs) {
-            std::fill(b.begin(), b.end(), 0.0f);
-        }
-        std::fill(prev_in.begin(), prev_in.end(), 0.0f);
+        for (auto& b : state_bufs) std::fill(b.begin(), b.end(), 0.0f);
+        prev_in.fill(0.0f);
     }
 
     bool run_model(const float* in_audio, float* out_dry, float* out_rest) {
-        if (!api || !session) return false;
+        const OrtApi* api = m->api;
+        const size_t n_states = state_bufs.size();
+        in_vals.assign(n_states + 1, nullptr);
+        out_vals.assign(n_states + 1, nullptr);
+        auto release_all = [&]() {
+            for (auto*& v : in_vals) { if (v) api->ReleaseValue(v); v = nullptr; }
+            for (auto*& v : out_vals) { if (v) api->ReleaseValue(v); v = nullptr; }
+        };
 
-        std::vector<const char*> in_ptrs;
-        std::vector<OrtValue*> in_vals;
-        std::vector<const char*> out_ptrs;
-        std::vector<OrtValue*> out_vals(output_names.size(), nullptr);
-
-        int64_t audio_shape[3] = {1, 2, kHop};
-        OrtValue* audio_val = nullptr;
+        static const int64_t kAudioShape[3] = {1, 2, kHop};
         OrtStatus* st = api->CreateTensorWithDataAsOrtValue(
-            mem_info, const_cast<float*>(in_audio), 2 * kHop * sizeof(float),
-            audio_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &audio_val);
-        if (st) {
-            api->ReleaseStatus(st);
-            return false;
-        }
-        in_ptrs.push_back(input_names[0].c_str());
-        in_vals.push_back(audio_val);
-
-        for (size_t i = 0; i < state_bufs.size(); ++i) {
-            OrtValue* sv = nullptr;
+            m->mem_info, const_cast<float*>(in_audio), 2 * kHop * sizeof(float),
+            kAudioShape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &in_vals[0]);
+        for (size_t i = 0; !st && i < n_states; ++i) {
             st = api->CreateTensorWithDataAsOrtValue(
-                mem_info, state_bufs[i].data(), state_bufs[i].size() * sizeof(float),
-                state_shapes[i].data(), state_shapes[i].size(),
-                ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &sv);
-            if (st) {
-                api->ReleaseStatus(st);
-                for (auto* v : in_vals) api->ReleaseValue(v);
-                return false;
-            }
-            in_ptrs.push_back(input_names[i + 1].c_str());
-            in_vals.push_back(sv);
+                m->mem_info, state_bufs[i].data(), state_bufs[i].size() * sizeof(float),
+                m->state_shapes[i].data(), m->state_shapes[i].size(),
+                ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &in_vals[i + 1]);
         }
-
-        for (const auto& name : output_names) {
-            out_ptrs.push_back(name.c_str());
+        if (!st) {
+            st = api->Run(m->session, nullptr, in_names.data(), in_vals.data(), in_vals.size(),
+                          out_names.data(), out_names.size(), out_vals.data());
         }
-
-        st = api->Run(session, nullptr, in_ptrs.data(), in_vals.data(), in_vals.size(),
-                      out_ptrs.data(), out_ptrs.size(), out_vals.data());
-
-        for (auto* v : in_vals) api->ReleaseValue(v);
-
         if (st) {
             api->ReleaseStatus(st);
-            for (auto* v : out_vals) if (v) api->ReleaseValue(v);
+            release_all();
             return false;
         }
 
         float* vocals_data = nullptr;
-        api->GetTensorMutableData(out_vals[0], reinterpret_cast<void**>(&vocals_data));
+        if (OrtStatus* gs = api->GetTensorMutableData(out_vals[0], reinterpret_cast<void**>(&vocals_data))) {
+            api->ReleaseStatus(gs);
+            release_all();
+            return false;
+        }
         std::memcpy(out_dry, prev_in.data(), 2 * kHop * sizeof(float));
         std::memcpy(prev_in.data(), in_audio, 2 * kHop * sizeof(float));
+        bool finite = true;
         for (int i = 0; i < 2 * kHop; ++i) {
-            out_rest[i] = out_dry[i] - vocals_data[i];
+            const float v = vocals_data[i];
+            finite = finite && std::isfinite(v);
+            out_rest[i] = out_dry[i] - v;
         }
-
-        for (size_t i = 0; i < state_bufs.size(); ++i) {
+        for (size_t i = 0; i < n_states; ++i) {
             float* sdata = nullptr;
-            api->GetTensorMutableData(out_vals[i + 1], reinterpret_cast<void**>(&sdata));
+            if (OrtStatus* gs = api->GetTensorMutableData(out_vals[i + 1], reinterpret_cast<void**>(&sdata))) {
+                api->ReleaseStatus(gs);
+                finite = false;
+                break;
+            }
             std::memcpy(state_bufs[i].data(), sdata, state_bufs[i].size() * sizeof(float));
         }
-
-        for (auto* v : out_vals) if (v) api->ReleaseValue(v);
+        release_all();
+        if (!finite) {
+            // A NaN/Inf in the recurrent state would poison every following hop.
+            reset_states();
+            return false;
+        }
         return true;
     }
 };
 
 PipelinedVocals::~PipelinedVocals() {
+    if (loader_.joinable()) {
+        loader_.join();
+    }
     if (!impl_) return;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -154,13 +367,7 @@ PipelinedVocals::~PipelinedVocals() {
     if (impl_->worker.joinable()) {
         impl_->worker.join();
     }
-    if (impl_->api) {
-        if (impl_->session) impl_->api->ReleaseSession(impl_->session);
-        if (impl_->opts) impl_->api->ReleaseSessionOptions(impl_->opts);
-        if (impl_->mem_info) impl_->api->ReleaseMemoryInfo(impl_->mem_info);
-        if (impl_->env) impl_->api->ReleaseEnv(impl_->env);
-    }
-    if (impl_->ort_lib) dlclose(impl_->ort_lib);
+    release_model(impl_->m);
     delete impl_;
     impl_ = nullptr;
 }
@@ -168,183 +375,98 @@ PipelinedVocals::~PipelinedVocals() {
 bool PipelinedVocals::ensure_loaded(const char* model_path, bool use_npu) {
     if (ready_.load()) return true;
     if (failed_.load()) return false;
+    // Loading ONNX Runtime and compiling the graph takes hundreds of milliseconds;
+    // doing it on the audio thread stalled playback the moment neural mode was
+    // switched on. Load in the background and keep the passive path meanwhile.
+    if (!loading_.exchange(true)) {
+        model_path_ = model_path;
+        loader_ = std::thread([this, use_npu]() { load(use_npu); });
+    }
+    return false;
+}
 
+void PipelinedVocals::load(bool use_npu) {
+    SharedModel* m = acquire_model(model_path_.c_str(), use_npu);
+    if (m == nullptr) {
+        failed_.store(true);
+        return;
+    }
     auto* d = new Impl();
-    // ONNX Runtime is shipped in the module and staged into /vendor/lib64/soundfx
-    // by post-fs-data.sh; the plain name covers an install where it lands in a
-    // regular library directory.
-    static const char* kOrtCandidates[] = {
-        "libonnxruntime.so",
-        "/vendor/lib64/soundfx/libonnxruntime.so",
-        "/vendor/lib64/libonnxruntime.so",
-    };
-    for (const char* cand : kOrtCandidates) {
-        d->ort_lib = dlopen(cand, RTLD_NOW | RTLD_LOCAL);
-        if (d->ort_lib) {
-            VLOGI("onnxruntime loaded: %s", cand);
-            break;
-        }
-        VLOGE("dlopen %s failed: %s", cand, dlerror());
-    }
-    if (!d->ort_lib) {
-        failed_.store(true);
-        delete d;
-        return false;
-    }
+    d->m = m;
+    for (size_t sz : m->state_sizes) d->state_bufs.emplace_back(sz, 0.0f);
+    for (const auto& n : m->input_names) d->in_names.push_back(n.c_str());
+    for (const auto& n : m->output_names) d->out_names.push_back(n.c_str());
+    d->fallback_buf.assign((1 + kMaxDelayHops) * 2 * kHop, 0.0f);
 
-    using GetApiBaseFn = const OrtApiBase* (*)();
-    auto get_base = reinterpret_cast<GetApiBaseFn>(dlsym(d->ort_lib, "OrtGetApiBase"));
-    if (!get_base) {
-        VLOGE("OrtGetApiBase not found");
-        failed_.store(true);
-        dlclose(d->ort_lib);
-        delete d;
-        return false;
-    }
-    d->api = get_base()->GetApi(ORT_API_VERSION);
-    if (!d->api) {
-        VLOGE("OrtApi version %d unavailable", ORT_API_VERSION);
-        failed_.store(true);
-        dlclose(d->ort_lib);
-        delete d;
-        return false;
-    }
-
-    if (auto* st = d->api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "AllySound", &d->env)) {
-        d->api->ReleaseStatus(st);
-        failed_.store(true);
-        dlclose(d->ort_lib);
-        delete d;
-        return false;
-    }
-
-    auto create_session = [&](bool try_npu) -> bool {
-        if (d->opts) { d->api->ReleaseSessionOptions(d->opts); d->opts = nullptr; }
-        d->api->CreateSessionOptions(&d->opts);
-        d->api->SetIntraOpNumThreads(d->opts, 2);
-        d->api->SetInterOpNumThreads(d->opts, 1);
-        if (try_npu) {
-            using NnapiFn = OrtStatus* (*)(OrtSessionOptions*, uint32_t);
-            auto append_nnapi = reinterpret_cast<NnapiFn>(
-                dlsym(d->ort_lib, "OrtSessionOptionsAppendExecutionProvider_Nnapi"));
-            if (append_nnapi) {
-                OrtStatus* nst = append_nnapi(d->opts, NNAPI_FLAG_USE_FP16);
-                if (!nst) {
-                    npu_active_.store(true);
-                } else {
-                    VLOGI("NNAPI EP unavailable (%s), using CPU", d->api->GetErrorMessage(nst));
-                    d->api->ReleaseStatus(nst);
-                    npu_active_.store(false);
-                }
-            }
-        } else {
-            npu_active_.store(false);
-        }
-        OrtStatus* sst = d->api->CreateSession(d->env, model_path, d->opts, &d->session);
-        if (sst) {
-            VLOGE("CreateSession failed (npu=%d): %s", try_npu ? 1 : 0, d->api->GetErrorMessage(sst));
-            d->api->ReleaseStatus(sst);
-            d->session = nullptr;
-            return false;
-        }
-        return true;
-    };
-
-    if (!(use_npu && create_session(true)) && !create_session(false)) {
-        failed_.store(true);
-        d->api->ReleaseEnv(d->env);
-        dlclose(d->ort_lib);
-        delete d;
-        return false;
-    }
-
-    d->api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &d->mem_info);
-
-    OrtAllocator* alloc = nullptr;
-    d->api->GetAllocatorWithDefaultOptions(&alloc);
-    size_t num_in = 0, num_out = 0;
-    d->api->SessionGetInputCount(d->session, &num_in);
-    d->api->SessionGetOutputCount(d->session, &num_out);
-
-    for (size_t i = 0; i < num_in; ++i) {
-        char* name = nullptr;
-        d->api->SessionGetInputName(d->session, i, alloc, &name);
-        d->input_names.emplace_back(name);
-        d->api->AllocatorFree(alloc, name);
-
-        if (i > 0) {
-            OrtTypeInfo* ti = nullptr;
-            d->api->SessionGetInputTypeInfo(d->session, i, &ti);
-            const OrtTensorTypeAndShapeInfo* si = nullptr;
-            d->api->CastTypeInfoToTensorInfo(ti, &si);
-            size_t dims = 0;
-            d->api->GetDimensionsCount(si, &dims);
-            std::vector<int64_t> shape(dims);
-            d->api->GetDimensions(si, shape.data(), dims);
-            size_t total = 1;
-            for (auto& dim : shape) {
-                if (dim <= 0) dim = 1;
-                total *= static_cast<size_t>(dim);
-            }
-            d->state_shapes.push_back(std::move(shape));
-            d->state_bufs.emplace_back(total, 0.0f);
-            d->api->ReleaseTypeInfo(ti);
-        }
-    }
-    for (size_t i = 0; i < num_out; ++i) {
-        char* name = nullptr;
-        d->api->SessionGetOutputName(d->session, i, alloc, &name);
-        d->output_names.emplace_back(name);
-        d->api->AllocatorFree(alloc, name);
-    }
-
-    d->prev_in.assign(2 * kHop, 0.0f);
-    d->fallback_buf.assign((1 + kBufferHops) * 2 * kHop, 0.0f);
-
-    // Warm up
-    std::vector<float> zeros(2 * kHop, 0.0f);
-    std::vector<float> d_tmp(2 * kHop, 0.0f);
-    std::vector<float> r_tmp(2 * kHop, 0.0f);
+    // Warm up (first Run allocates kernels and caches).
+    HopBuf zeros{}, d_tmp{}, r_tmp{};
     for (int i = 0; i < 4; ++i) {
         d->run_model(zeros.data(), d_tmp.data(), r_tmp.data());
     }
     d->reset_states();
 
+    npu_active_.store(m->npu);
     impl_ = d;
-    impl_->worker = std::thread([this]() { worker_loop(); });
-    ready_.store(true);
-    VLOGI("StemgenRT loaded (npu=%d)", npu_active_.load() ? 1 : 0);
-    return true;
+    d->worker = std::thread([this]() { worker_loop(); });
+    ready_.store(true); // publishes impl_ to the audio thread
+}
+
+void PipelinedVocals::note_block_frames(int frames) {
+    const int needed = std::clamp((frames + kHop - 1) / kHop + kMarginHops, kMinDelayHops, kMaxDelayHops);
+    // Only grow: AudioFlinger occasionally hands over a short tail, which must not
+    // make the pipeline shrink and resync.
+    if (needed > delay_hops_) {
+        delay_hops_ = needed;
+        delay_changed_ = true;
+        VLOGI("pipeline delay -> %d hops (block of %d frames)", delay_hops_, frames);
+    }
 }
 
 void PipelinedVocals::worker_loop() {
+    Impl* d = impl_; // set before this thread is started
     uint64_t worker_gen = UINT64_MAX;
+    uint32_t runs = 0;
+    double run_ms_sum = 0.0, run_ms_max = 0.0;
+    auto last_log = std::chrono::steady_clock::now();
     while (true) {
         QueuedHop item;
         {
-            std::unique_lock<std::mutex> lock(impl_->mutex);
-            impl_->cv.wait(lock, [&]() { return impl_->stop || !impl_->inbox.empty(); });
-            if (impl_->stop) break;
-            item = std::move(impl_->inbox.front());
-            impl_->inbox.pop_front();
+            std::unique_lock<std::mutex> lock(d->mutex);
+            d->cv.wait(lock, [&]() { return d->stop || !d->inbox.empty(); });
+            if (d->stop) break;
+            item = d->inbox.front();
+            d->inbox.pop_front();
         }
 
         if (item.gen != worker_gen) {
-            impl_->reset_states();
+            d->reset_states();
             worker_gen = item.gen;
         }
 
         OutHop out;
         out.gen = item.gen;
-        out.seq = item.seq;
-        out.dry.resize(2 * kHop);
-        out.rest.resize(2 * kHop);
-        if (impl_->run_model(item.audio.data(), out.dry.data(), out.rest.data())) {
-            std::lock_guard<std::mutex> lock(impl_->mutex);
-            if (item.gen == impl_->gen && item.seq >= 1) {
-                out.seq = item.seq - 1;
-                impl_->outbox.push_back(std::move(out));
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = d->run_model(item.audio.data(), out.dry.data(), out.rest.data());
+        const auto t1 = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        runs++;
+        run_ms_sum += ms;
+        run_ms_max = std::max(run_ms_max, ms);
+        if (ok && item.seq >= 1) {
+            out.seq = item.seq - 1; // the model output lags its input by one hop
+            std::lock_guard<std::mutex> lock(d->mutex);
+            if (item.gen == d->gen) {
+                d->outbox.push_back(out);
             }
+        }
+        if (std::chrono::duration_cast<std::chrono::seconds>(t1 - last_log).count() >= 5) {
+            VLOGI("separator: runs=%u avg=%.2fms max=%.2fms hops=%u misses=%u resets=%u npu=%d",
+                  runs, runs ? run_ms_sum / runs : 0.0, run_ms_max,
+                  d->stat_hops.exchange(0), d->stat_misses.exchange(0), d->stat_resets.exchange(0),
+                  npu_active_.load() ? 1 : 0);
+            runs = 0;
+            run_ms_sum = run_ms_max = 0.0;
+            last_log = t1;
         }
     }
 }
@@ -364,88 +486,101 @@ void PipelinedVocals::process(const float* stereo_in, float* dry_out, float* res
         passive_matrix(dry_out, rest_out);
         return;
     }
+    Impl* d = impl_;
+    d->stat_hops.fetch_add(1, std::memory_order_relaxed);
+    const size_t delay_hops = static_cast<size_t>(delay_hops_);
 
     uint64_t cur_gen, cur_seq;
     {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (impl_->last_tick != UINT64_MAX && tick != impl_->last_tick + 1) {
-            impl_->gen++;
-            impl_->seq = 0;
-            impl_->inbox.clear();
-            impl_->outbox.clear();
-            std::fill(impl_->fallback_buf.begin(), impl_->fallback_buf.end(), 0.0f);
-            impl_->fallback_pos = 0;
-            impl_->wet = 1.0f;
+        std::lock_guard<std::mutex> lock(d->mutex);
+        bool resync = delay_changed_ ||
+                      (d->last_tick != UINT64_MAX && tick != d->last_tick + 1);
+        // The worker fell far behind (device too slow): drop the backlog and restart
+        // the model rather than letting the queue grow without bound.
+        if (d->inbox.size() > 2 * delay_hops) {
+            resync = true;
+            d->stat_resets.fetch_add(1, std::memory_order_relaxed);
         }
-        impl_->last_tick = tick;
-        cur_seq = impl_->seq++;
-        if (impl_->inbox.size() > kBufferHops + 4) {
-            impl_->gen++;
-            impl_->seq = 1;
-            cur_seq = 0;
-            impl_->inbox.clear();
-            impl_->outbox.clear();
-            impl_->wet = 0.0f;
+        if (resync) {
+            d->gen++;
+            d->seq = 0;
+            d->inbox.clear();
+            d->outbox.clear();
+            std::fill(d->fallback_buf.begin(), d->fallback_buf.end(), 0.0f);
+            d->fallback_pos = 0;
+            d->wet = 0.0f;
+            delay_changed_ = false;
         }
-        cur_gen = impl_->gen;
-        QueuedHop q{cur_gen, cur_seq, std::vector<float>(stereo_in, stereo_in + 2 * kHop)};
-        impl_->inbox.push_back(std::move(q));
+        d->last_tick = tick;
+        cur_seq = d->seq++;
+        cur_gen = d->gen;
+        QueuedHop& q = d->inbox.emplace_back();
+        q.gen = cur_gen;
+        q.seq = cur_seq;
+        std::memcpy(q.audio.data(), stereo_in, 2 * kHop * sizeof(float));
     }
-    impl_->cv.notify_one();
+    d->cv.notify_one();
 
-    // Advance fallback delay line
-    const size_t delay_hops = 1 + kBufferHops;
-    float* slot = &impl_->fallback_buf[impl_->fallback_pos * 2 * kHop];
-    std::array<float, 2 * kHop> dry_ref{};
+    // Fallback delay line: the passive path is delayed exactly like the model path,
+    // so switching between them never jumps in time.
+    const size_t ring = 1 + delay_hops;
+    float* slot = &d->fallback_buf[d->fallback_pos * 2 * kHop];
+    HopBuf dry_ref;
     std::memcpy(dry_ref.data(), slot, 2 * kHop * sizeof(float));
     std::memcpy(slot, stereo_in, 2 * kHop * sizeof(float));
-    impl_->fallback_pos = (impl_->fallback_pos + 1) % delay_hops;
+    d->fallback_pos = (d->fallback_pos + 1) % ring;
 
-    if (cur_seq < delay_hops) {
+    if (cur_seq < ring) {
         std::memcpy(dry_out, dry_ref.data(), 2 * kHop * sizeof(float));
         passive_matrix(dry_out, rest_out);
         return;
     }
 
-    uint64_t target_seq = cur_seq - delay_hops;
+    const uint64_t target_seq = cur_seq - ring;
     bool got = false;
-    OutHop res;
     {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        while (!impl_->outbox.empty() &&
-               (impl_->outbox.front().gen != cur_gen || impl_->outbox.front().seq < target_seq)) {
-            impl_->outbox.pop_front();
+        std::lock_guard<std::mutex> lock(d->mutex);
+        while (!d->outbox.empty() &&
+               (d->outbox.front().gen != cur_gen || d->outbox.front().seq < target_seq)) {
+            d->outbox.pop_front();
         }
-        if (!impl_->outbox.empty() &&
-            impl_->outbox.front().gen == cur_gen &&
-            impl_->outbox.front().seq == target_seq) {
-            res = std::move(impl_->outbox.front());
-            impl_->outbox.pop_front();
+        if (!d->outbox.empty() && d->outbox.front().seq == target_seq) {
+            const OutHop& res = d->outbox.front();
+            std::memcpy(dry_out, res.dry.data(), 2 * kHop * sizeof(float));
+            std::memcpy(rest_out, res.rest.data(), 2 * kHop * sizeof(float));
+            d->outbox.pop_front();
             got = true;
         }
     }
 
-    if (got) {
-        std::memcpy(dry_out, res.dry.data(), 2 * kHop * sizeof(float));
-        if (impl_->wet < 1.0f) {
-            std::array<float, 2 * kHop> p_rest{};
-            passive_matrix(dry_out, p_rest.data());
-            float step = (1.0f - impl_->wet) / static_cast<float>(kHop - 1);
-            for (int i = 0; i < kHop; ++i) {
-                float w = impl_->wet + step * i;
-                rest_out[i] = p_rest[i] * (1.0f - w) + res.rest[i] * w;
-                rest_out[kHop + i] = p_rest[kHop + i] * (1.0f - w) + res.rest[kHop + i] * w;
-            }
-            impl_->wet = 1.0f;
-        } else {
-            std::memcpy(rest_out, res.rest.data(), 2 * kHop * sizeof(float));
-        }
+    if (!got) {
+        d->stat_misses.fetch_add(1, std::memory_order_relaxed);
+        d->cooldown = kMissCooldownHops;
+    } else if (d->cooldown > 0) {
+        d->cooldown--;
+        got = false;
+    }
+
+    if (!got) {
+        d->wet = 0.0f;
+        std::memcpy(dry_out, dry_ref.data(), 2 * kHop * sizeof(float));
+        passive_matrix(dry_out, rest_out);
         return;
     }
 
-    impl_->wet = 0.0f;
-    std::memcpy(dry_out, dry_ref.data(), 2 * kHop * sizeof(float));
-    passive_matrix(dry_out, rest_out);
+    if (d->wet < 1.0f) {
+        // Fade the model in over ~10 ms (four hops) from the passive matrix.
+        HopBuf p_rest;
+        passive_matrix(dry_out, p_rest.data());
+        const float end = std::min(1.0f, d->wet + 0.25f);
+        const float step = (end - d->wet) / static_cast<float>(kHop);
+        for (int i = 0; i < kHop; ++i) {
+            const float w = d->wet + step * static_cast<float>(i + 1);
+            rest_out[i] = p_rest[i] * (1.0f - w) + rest_out[i] * w;
+            rest_out[kHop + i] = p_rest[kHop + i] * (1.0f - w) + rest_out[kHop + i] * w;
+        }
+        d->wet = end;
+    }
 }
 
 } // namespace ally
