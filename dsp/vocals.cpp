@@ -12,7 +12,9 @@
 #include <cmath>
 #include <complex>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 
 #ifdef __ANDROID__
@@ -29,6 +31,8 @@ namespace ally {
 namespace {
 
 constexpr int kHop = PipelinedVocals::kHop;
+constexpr int kQnnHops = 15;
+constexpr int kQnnMarginHops = 10;
 using HopBuf = std::array<float, 2 * kHop>;
 
 struct QueuedHop {
@@ -81,15 +85,18 @@ bool has_nnapi_accelerator() {
     return found;
 }
 
-// One ONNX Runtime + one compiled session for the whole process. Every effect
-// instance (one per app session) only owns its recurrent state; OrtSession::Run is
-// thread-safe, so instances share the ~30 MB of runtime, weights and graph.
+// Share sessions across effects using the same model and acceleration setting.
+// Each effect owns its own recurrent state.
 struct SharedModel {
     void* lib = nullptr;
     const OrtApi* api = nullptr;
     OrtEnv* env = nullptr;
     OrtSessionOptions* opts = nullptr;
     OrtSession* session = nullptr;
+    OrtSession* qnn_core = nullptr;
+    OrtSession* qnn_decoder = nullptr;
+    OrtSession* cpu_decoder = nullptr;
+    std::atomic<bool> qnn_healthy{false};
     OrtMemoryInfo* mem_info = nullptr;
     std::vector<std::string> input_names;
     std::vector<std::string> output_names;
@@ -112,6 +119,9 @@ struct SharedModel {
 
     ~SharedModel() {
         if (api) {
+            if (cpu_decoder) api->ReleaseSession(cpu_decoder);
+            if (qnn_decoder) api->ReleaseSession(qnn_decoder);
+            if (qnn_core) api->ReleaseSession(qnn_core);
             if (session) api->ReleaseSession(session);
             if (opts) api->ReleaseSessionOptions(opts);
             if (mem_info) api->ReleaseMemoryInfo(mem_info);
@@ -122,7 +132,7 @@ struct SharedModel {
 };
 
 std::mutex g_model_mutex;
-SharedModel* g_model = nullptr;
+std::map<std::pair<std::string, bool>, SharedModel*> g_models;
 
 constexpr int kFft = 1024;
 constexpr int kBins = kFft / 2 + 1;
@@ -149,6 +159,35 @@ bool load_dsp_params(const std::string& path, SharedModel* m) {
 
 #define ORT_OK(expr) (([&]() { OrtStatus* _s = (expr); if (_s) { VLOGE("%s: %s", #expr, m->api->GetErrorMessage(_s)); m->api->ReleaseStatus(_s); return false; } return true; })())
 
+bool load_qnn(SharedModel* m, const std::string& dir) {
+    const std::string backend = dir + "libQnnHtp.so";
+    if (!ORT_OK(m->api->AddSessionConfigEntry(m->opts, "session.disable_cpu_ep_fallback", "1"))) return false;
+    const char* previous_path = std::getenv("ADSP_LIBRARY_PATH");
+    const bool had_path = previous_path != nullptr;
+    const std::string dsp_path = dir + (previous_path ? ";" + std::string(previous_path) : "");
+    if (setenv("ADSP_LIBRARY_PATH", dsp_path.c_str(), 1) != 0) return false;
+    const std::string core = dir + "vocals_core.onnx";
+    const std::string decoder = dir + "vocals_decoder.onnx";
+    const char* keys[] = {"backend_path", "enable_htp_fp16_precision", "htp_performance_mode"};
+    const char* values[] = {backend.c_str(), "1", "burst"};
+    const bool ready = ORT_OK(m->api->SessionOptionsAppendExecutionProvider(m->opts, "QNN", keys, values, 3)) &&
+                       ORT_OK(m->api->CreateSession(m->env, decoder.c_str(), m->opts, &m->qnn_decoder));
+    if (had_path) setenv("ADSP_LIBRARY_PATH", dsp_path.c_str() + dir.size() + 1, 1);
+    else unsetenv("ADSP_LIBRARY_PATH");
+    if (!ready) return false;
+
+    OrtSessionOptions* cpu = nullptr;
+    if (!ORT_OK(m->api->CreateSessionOptions(&cpu))) return false;
+    const bool cpu_ready = ORT_OK(m->api->SetIntraOpNumThreads(cpu, 1)) &&
+                           ORT_OK(m->api->DisableCpuMemArena(cpu)) &&
+                           ORT_OK(m->api->AddSessionConfigEntry(cpu, "session.intra_op.allow_spinning", "0")) &&
+                           ORT_OK(m->api->CreateSession(m->env, core.c_str(), cpu, &m->qnn_core)) &&
+                           ORT_OK(m->api->CreateSession(m->env, decoder.c_str(), cpu, &m->cpu_decoder));
+    m->api->ReleaseSessionOptions(cpu);
+    m->qnn_healthy.store(cpu_ready);
+    return cpu_ready;
+}
+
 SharedModel* load_model(const char* full_model_path, bool use_npu) {
     auto* m = new SharedModel();
     std::string path = full_model_path;
@@ -162,12 +201,21 @@ SharedModel* load_model(const char* full_model_path, bool use_npu) {
         }
     }
     const char* model_path = path.c_str();
+    const std::string qnn_dir = path.substr(0, path.find_last_of('/') + 1) + "ally-qnn/";
+    const std::string qnn_runtime = qnn_dir + "libonnxruntime.so";
+    const bool qnn_requested = use_npu && m->split && access(qnn_runtime.c_str(), R_OK) == 0;
+    if (qnn_requested) {
+        m->lib = dlopen(qnn_runtime.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (!m->lib) VLOGE("QNN runtime load failed: %s", dlerror());
+    }
+    const bool qnn_runtime_loaded = m->lib != nullptr;
     static const char* kOrtCandidates[] = {
         "libonnxruntime.so",
         "/vendor/lib64/soundfx/libonnxruntime.so",
         "/vendor/lib64/libonnxruntime.so",
     };
     for (const char* cand : kOrtCandidates) {
+        if (m->lib) break;
         m->lib = dlopen(cand, RTLD_NOW | RTLD_LOCAL);
         if (m->lib) {
             VLOGI("onnxruntime loaded: %s", cand);
@@ -226,13 +274,20 @@ SharedModel* load_model(const char* full_model_path, bool use_npu) {
         return true;
     };
 
-    const bool try_npu = use_npu && has_nnapi_accelerator();
-    if (use_npu && !try_npu) {
+    const bool try_npu = use_npu && !qnn_requested && has_nnapi_accelerator();
+    if (use_npu && !qnn_requested && !try_npu) {
         VLOGI("no NNAPI accelerator registered, running the separator on CPU");
     }
     if (!(try_npu && create_session(true)) && !create_session(false)) {
         delete m;
         return nullptr;
+    }
+    if (qnn_runtime_loaded) {
+        if (load_qnn(m, qnn_dir)) {
+            VLOGI("QNN decoder ready: FP32 CPU recurrent core, HTP mask decoder, %d hops", kQnnHops);
+        } else {
+            VLOGE("QNN hybrid initialization failed; using the CPU separator");
+        }
     }
     // The session keeps what it needs; the options are no longer used.
     m->api->ReleaseSessionOptions(m->opts);
@@ -284,26 +339,29 @@ SharedModel* load_model(const char* full_model_path, bool use_npu) {
         delete m;
         return nullptr;
     }
-    VLOGI("StemgenRT session ready (%s, npu=%d, %zu state tensors)", m->split ? "split" : "full",
-          m->npu ? 1 : 0, m->state_sizes.size());
+    VLOGI("StemgenRT session ready (%s, %s, %zu state tensors)", m->split ? "split" : "full",
+          m->qnn_healthy.load() ? "QNN hybrid" : m->npu ? "NNAPI" : "CPU", m->state_sizes.size());
     return m;
 }
 
 SharedModel* acquire_model(const char* model_path, bool use_npu) {
     std::lock_guard<std::mutex> lock(g_model_mutex);
-    if (g_model == nullptr) {
-        g_model = load_model(model_path, use_npu);
-        if (g_model == nullptr) return nullptr;
+    const std::pair<std::string, bool> key{model_path, use_npu};
+    auto it = g_models.find(key);
+    if (it == g_models.end()) {
+        SharedModel* model = load_model(model_path, use_npu);
+        if (!model) return nullptr;
+        it = g_models.emplace(key, model).first;
     }
-    g_model->refs++;
-    return g_model;
+    it->second->refs++;
+    return it->second;
 }
 
 void release_model(SharedModel* m) {
     if (m == nullptr) return;
     std::lock_guard<std::mutex> lock(g_model_mutex);
     if (--m->refs == 0) {
-        if (g_model == m) g_model = nullptr;
+        std::erase_if(g_models, [m](const auto& entry) { return entry.second == m; });
         delete m;
     }
 }
@@ -331,6 +389,9 @@ struct PipelinedVocals::Impl {
     std::vector<std::complex<float>> masked;     // kBins
     std::vector<float> synth;                    // kFft
     HopBuf vocals{};
+    std::vector<float> qnn_features;
+    std::vector<std::complex<float>> qnn_spectra;
+    bool batched = false;
 
     std::mutex mutex;
     std::condition_variable cv;
@@ -405,6 +466,96 @@ struct PipelinedVocals::Impl {
                 t[i] = seg[kHop + i] * m->synthesis[kHop + i];
             }
         }
+    }
+
+    bool run_qnn_batch(const std::array<QueuedHop, kQnnHops>& items,
+                       std::array<OutHop, kQnnHops>& outputs) {
+        const OrtApi* api = m->api;
+        constexpr size_t feature_size = 2 * kBins * 3;
+        constexpr size_t mask_size = 2 * kBins * 2;
+        constexpr int64_t features_shape[] = {kQnnHops, 1, 1, 2, kBins, 3};
+        constexpr int64_t local_shape[] = {2, 20, 96};
+        constexpr int64_t global_shape[] = {2, 1, 192};
+        constexpr int64_t decode_shape[] = {kQnnHops, 20, 96};
+        const char* core_inputs[] = {"features", "vocals_local_hidden", "vocals_global_hidden"};
+        const char* core_outputs[] = {"encoded", "next_vocals_local_hidden", "next_vocals_global_hidden"};
+        const char* decoder_input = "encoded";
+        const char* decoder_output = "mask";
+        for (size_t i = 0; i < items.size(); ++i) {
+            front_end(items[i].audio.data());
+            std::copy(features.begin(), features.end(), qnn_features.begin() + i * feature_size);
+            std::copy(spectrum.begin(), spectrum.end(), qnn_spectra.begin() + i * 2 * kBins);
+        }
+
+        OrtValue* inputs[3]{};
+        OrtValue* core[3]{};
+        OrtValue* encoded = nullptr;
+        OrtValue* mask = nullptr;
+        auto tensor = [&](std::vector<float>& values, const auto& shape, OrtValue** out) {
+            return ORT_OK(api->CreateTensorWithDataAsOrtValue(
+                m->mem_info, values.data(), values.size() * sizeof(float),
+                shape, std::size(shape), ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, out));
+        };
+        auto data = [&](OrtValue* value, size_t size, float** samples) {
+            OrtTensorTypeAndShapeInfo* shape = nullptr;
+            if (!ORT_OK(api->GetTensorTypeAndShape(value, &shape))) return false;
+            size_t count = 0;
+            ONNXTensorElementDataType type;
+            const bool matches = ORT_OK(api->GetTensorShapeElementCount(shape, &count)) &&
+                                 ORT_OK(api->GetTensorElementType(shape, &type)) &&
+                                 type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT && count == size;
+            api->ReleaseTensorTypeAndShapeInfo(shape);
+            return matches && ORT_OK(api->GetTensorMutableData(value, reinterpret_cast<void**>(samples))) &&
+                   std::all_of(*samples, *samples + size, [](float x) { return std::isfinite(x); });
+        };
+        const bool have_core =
+            tensor(qnn_features, features_shape, &inputs[0]) &&
+            tensor(state_bufs[0], local_shape, &inputs[1]) &&
+            tensor(state_bufs[1], global_shape, &inputs[2]) &&
+            ORT_OK(api->Run(m->qnn_core, nullptr, core_inputs, inputs, 3, core_outputs, 3, core));
+        float* encoding = nullptr;
+        float* local = nullptr;
+        float* global = nullptr;
+        float* masks = nullptr;
+        constexpr size_t encoded_size = kQnnHops * 20 * 96;
+        bool ok = have_core && data(core[0], encoded_size, &encoding) &&
+                  data(core[1], state_bufs[0].size(), &local) &&
+                  data(core[2], state_bufs[1].size(), &global) &&
+                  ORT_OK(api->CreateTensorWithDataAsOrtValue(
+                      m->mem_info, encoding, encoded_size * sizeof(float), decode_shape,
+                      std::size(decode_shape), ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &encoded));
+        if (ok) {
+            auto decode = [&](OrtSession* session) {
+                return ORT_OK(api->Run(session, nullptr, &decoder_input, &encoded, 1, &decoder_output, 1, &mask)) &&
+                       data(mask, kQnnHops * mask_size, &masks);
+            };
+            ok = m->qnn_healthy.load() && decode(m->qnn_decoder);
+            if (!ok) {
+                if (m->qnn_healthy.exchange(false)) VLOGE("QNN decoder failed; switching to CPU mask decoder");
+                if (mask) { api->ReleaseValue(mask); mask = nullptr; }
+                ok = decode(m->cpu_decoder);
+            }
+        }
+        if (ok) {
+            std::copy_n(local, state_bufs[0].size(), state_bufs[0].begin());
+            std::copy_n(global, state_bufs[1].size(), state_bufs[1].begin());
+            for (size_t i = 0; i < items.size(); ++i) {
+                std::copy_n(qnn_spectra.begin() + i * 2 * kBins, 2 * kBins, spectrum.begin());
+                back_end(masks + i * mask_size);
+                outputs[i].dry = prev_in;
+                prev_in = items[i].audio;
+                for (size_t j = 0; j < prev_in.size(); ++j) {
+                    outputs[i].rest[j] = outputs[i].dry[j] - vocals[j];
+                    ok = ok && std::isfinite(outputs[i].rest[j]);
+                }
+            }
+        }
+        if (mask) api->ReleaseValue(mask);
+        if (encoded) api->ReleaseValue(encoded);
+        for (auto* v : core) if (v) api->ReleaseValue(v);
+        for (auto* v : inputs) if (v) api->ReleaseValue(v);
+        if (!ok) reset_states();
+        return ok;
     }
 
     bool run_model(const float* in_audio, float* out_dry, float* out_rest) {
@@ -569,14 +720,30 @@ void PipelinedVocals::load(bool use_npu) {
     }
     d->reset_states();
 
-    npu_active_.store(m->npu);
+    if (m->qnn_healthy.load() && m->state_sizes == std::vector<size_t>{2 * 20 * 96, 2 * 192}) {
+        d->qnn_features.resize(kQnnHops * 2 * kBins * 3);
+        d->qnn_spectra.resize(kQnnHops * 2 * kBins);
+        const std::array<QueuedHop, kQnnHops> input{};
+        std::array<OutHop, kQnnHops> output;
+        d->batched = d->run_qnn_batch(input, output) && m->qnn_healthy.load();
+        d->reset_states();
+        if (!d->batched) VLOGE("QNN warm-up failed; using the CPU separator");
+    }
+    npu_active_.store(m->npu || d->batched);
     impl_ = d;
     d->worker = std::thread([this]() { worker_loop(); });
     ready_.store(true); // publishes impl_ to the audio thread
 }
 
 void PipelinedVocals::note_block_frames(int frames) {
-    const int needed = std::clamp((frames + kHop - 1) / kHop + kMarginHops, kMinDelayHops, kMaxDelayHops);
+    const int hops = std::max(1, (frames + kHop - 1) / kHop);
+    int requested = hops + kMarginHops;
+    if (ready_.load() && impl_->batched) {
+        // A decoder batch can straddle callbacks when callback and batch widths differ.
+        requested = std::max(hops, kQnnHops) + kQnnMarginHops +
+                    (hops == kQnnHops ? 0 : std::min(hops, kQnnHops) - 1);
+    }
+    const int needed = std::clamp(requested, kMinDelayHops, kMaxDelayHops);
     // Only grow: AudioFlinger occasionally hands over a short tail, which must not
     // make the pipeline shrink and resync.
     if (needed > delay_hops_) {
@@ -592,40 +759,48 @@ void PipelinedVocals::worker_loop() {
     uint32_t runs = 0;
     double run_ms_sum = 0.0, run_ms_max = 0.0;
     auto last_log = std::chrono::steady_clock::now();
+    const size_t count = d->batched ? kQnnHops : 1;
+    std::array<QueuedHop, kQnnHops> items;
+    std::array<OutHop, kQnnHops> outputs;
     while (true) {
-        QueuedHop item;
         {
             std::unique_lock<std::mutex> lock(d->mutex);
-            d->cv.wait(lock, [&]() { return d->stop || !d->inbox.empty(); });
+            d->cv.wait(lock, [&]() { return d->stop || d->inbox.size() >= count; });
             if (d->stop) break;
-            item = d->inbox.front();
-            d->inbox.pop_front();
+            for (size_t i = 0; i < count; ++i) {
+                items[i] = d->inbox.front();
+                d->inbox.pop_front();
+            }
         }
 
-        if (item.gen != worker_gen) {
+        if (items[0].gen != worker_gen) {
             d->reset_states();
-            worker_gen = item.gen;
+            worker_gen = items[0].gen;
         }
 
-        OutHop out;
-        out.gen = item.gen;
         const auto t0 = std::chrono::steady_clock::now();
-        const bool ok = d->run_model(item.audio.data(), out.dry.data(), out.rest.data());
+        const bool ok = d->batched ? d->run_qnn_batch(items, outputs) :
+            d->run_model(items[0].audio.data(), outputs[0].dry.data(), outputs[0].rest.data());
+        if (d->batched) npu_active_.store(d->m->qnn_healthy.load());
         const auto t1 = std::chrono::steady_clock::now();
         const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         runs++;
         run_ms_sum += ms;
         run_ms_max = std::max(run_ms_max, ms);
-        if (ok && item.seq >= 1) {
-            out.seq = item.seq - 1; // the model output lags its input by one hop
+        if (ok) {
             std::lock_guard<std::mutex> lock(d->mutex);
-            if (item.gen == d->gen) {
-                d->outbox.push_back(out);
+            if (worker_gen == d->gen) {
+                for (size_t i = 0; i < count; ++i) {
+                    if (items[i].seq == 0) continue;
+                    outputs[i].gen = worker_gen;
+                    outputs[i].seq = items[i].seq - 1; // inference has a one-hop lag
+                    d->outbox.push_back(outputs[i]);
+                }
             }
         }
         if (std::chrono::duration_cast<std::chrono::seconds>(t1 - last_log).count() >= 5) {
-            VLOGI("separator: runs=%u avg=%.2fms max=%.2fms hops=%u misses=%u resets=%u npu=%d",
-                  runs, runs ? run_ms_sum / runs : 0.0, run_ms_max,
+            VLOGI("separator: runs=%u batch=%zu avg=%.2fms max=%.2fms hops=%u misses=%u resets=%u npu=%d",
+                  runs, count, runs ? run_ms_sum / runs : 0.0, run_ms_max,
                   d->stat_hops.exchange(0), d->stat_misses.exchange(0), d->stat_resets.exchange(0),
                   npu_active_.load() ? 1 : 0);
             runs = 0;

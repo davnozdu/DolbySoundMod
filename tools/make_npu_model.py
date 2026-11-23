@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Split StemgenRT vocals.onnx into a CPU/NPU pipeline for the Hexagon NPU (QNN HTP).
 
-usage: make_npu_model.py vocals.onnx OUTDIR [--hops 15]
+usage: make_npu_model.py vocals.onnx OUTDIR [--hops 15] [--cpu-recurrent]
 
 writes OUTDIR/vocals_pre.onnx, vocals_backbone.onnx, vocals_post.onnx
+With --cpu-recurrent, writes vocals_core.onnx and vocals_decoder.onnx in place
+of the backbone. Only the stateless mask decoder runs on the HTP in this mode.
 
 Why a split: run whole on HTP the model is fp16 end to end, and the 1024-point
 FFT front end then buries the quiet top octave in rounding noise; the recurrent
@@ -27,7 +29,7 @@ the NPU vs 6.8 ms on the CPU, and the CPU-only split matches the original to
 first second, -6..-14 dB after three), so the module keeps the model on the CPU.
 Each op alone is within 0.1-0.5% on HTP; the drift is the GRU accumulating it.
 
-The backbone is rewritten for HTP: shapes are folded to constants and every
+The HTP graphs fold shapes to constants and every
 tensor above rank 4 is re-expressed without its unit dimensions (HTP rejects the
 5-7D transposes of the band-split encoder). Each block tensor is laid out as
 [hops, *per_hop_shape]. The pipeline is checked against the original model
@@ -44,6 +46,7 @@ from onnx import TensorProto, helper, numpy_helper
 
 HOP = 128
 FEATURES = "/vocals/Transpose_output_0"
+ENCODED = "/vocals/backbone/Add_6_output_0"
 MASK = "/vocals/backbone/Concat_19_output_0"
 
 def fold(model):
@@ -244,13 +247,14 @@ def dims(model, name):
     raise KeyError(name)
 
 
-def unroll(model, hops, block_in, states, block_out, rename=None):
+def unroll(model, hops, block_in, states, block_out, rename=None, compact_blocks=False):
     """Unroll a one-hop model: block tensors are [hops, *per_hop_shape].
 
     block_in:  per-hop inputs, fed as one [hops, ...] tensor each
     states:    (input, output) pairs carried from hop to hop
     block_out: per-hop outputs, returned as one [hops, ...] tensor each
     rename:    public names for the block tensors
+    compact_blocks: drop per-hop unit dimensions at the public block boundary
     """
     rename = rename or {}
     g = model.graph
@@ -260,6 +264,12 @@ def unroll(model, hops, block_in, states, block_out, rename=None):
 
     def public(n):
         return rename.get(n, n)
+
+    def block_shape(n, count):
+        per_hop = shape[n]
+        if compact_blocks:
+            per_hop = [d for d in per_hop if d != 1]
+        return [count] + per_hop
 
     for name in block_in:
         s = shape[name]
@@ -296,7 +306,7 @@ def unroll(model, hops, block_in, states, block_out, rename=None):
             nodes.append(helper.make_node("Reshape", [src, f"u/{name}/oshape"], [f"u/h{h}/{name}/out"]))
             outs[name].append(f"u/h{h}/{name}/out")
     for name in block_out:
-        extra_init.append(numpy_helper.from_array(np.array([1] + shape[name], np.int64), f"u/{name}/oshape"))
+        extra_init.append(numpy_helper.from_array(np.array(block_shape(name, 1), np.int64), f"u/{name}/oshape"))
         nodes.append(helper.make_node("Concat", outs[name], [public(name)], axis=0))
 
     def vi(name, s):
@@ -304,8 +314,8 @@ def unroll(model, hops, block_in, states, block_out, rename=None):
 
     graph = helper.make_graph(
         nodes, f"{g.name or 'stage'}_x{hops}",
-        [vi(public(n), [hops] + shape[n]) for n in block_in] + [vi(si, shape[si]) for si, _ in states],
-        [vi(public(n), [hops] + shape[n]) for n in block_out] + [vi("next_" + si, shape[si]) for si, _ in states],
+        [vi(public(n), block_shape(n, hops)) for n in block_in] + [vi(si, shape[si]) for si, _ in states],
+        [vi(public(n), block_shape(n, hops)) for n in block_out] + [vi("next_" + si, shape[si]) for si, _ in states],
         initializer=list(g.initializer) + extra_init,
     )
     out = helper.make_model(graph, opset_imports=model.opset_import)
@@ -314,7 +324,7 @@ def unroll(model, hops, block_in, states, block_out, rename=None):
     return out
 
 
-def build(src, hops):
+def build(src, hops, cpu_recurrent=False):
     folded = fold(onnx.load(src))
     ins = [i.name for i in folded.graph.input]
     audio, history, local, glob, tail = ins
@@ -322,13 +332,22 @@ def build(src, hops):
     sep, next_hist, next_local, next_glob, next_tail = outs
 
     pre = extract(folded, [audio, history], [FEATURES, next_hist])
-    backbone = reduce_rank(extract(folded, [FEATURES, local, glob], [MASK, next_local, next_glob]))
     post = extract(folded, [MASK, audio, history, tail], [sep, next_hist, next_tail])
 
-    names = {audio: "audio", FEATURES: "features", MASK: "mask", sep: "separated"}
+    names = {audio: "audio", FEATURES: "features", ENCODED: "encoded", MASK: "mask", sep: "separated"}
+    states = [(local, next_local), (glob, next_glob)]
     pre_u = unroll(pre, hops, [audio], [(history, next_hist)], [FEATURES], names)
-    bb_u = unroll(backbone, hops, [FEATURES], [(local, next_local), (glob, next_glob)], [MASK], names)
     post_u = unroll(post, hops, [MASK, audio], [(history, next_hist), (tail, next_tail)], [sep], names)
+    if cpu_recurrent:
+        core = extract(folded, [FEATURES, local, glob], [ENCODED, next_local, next_glob])
+        decoder = reduce_rank(extract(folded, [ENCODED], [MASK]))
+        core_u = unroll(core, hops, [FEATURES], states, [ENCODED], names)
+        # The leading block dimension would otherwise force the decoder's
+        # input reshapes and output concat onto the CPU.
+        decoder_u = unroll(decoder, hops, [ENCODED], [], [MASK], names, compact_blocks=True)
+        return pre_u, core_u, decoder_u, post_u
+    backbone = reduce_rank(extract(folded, [FEATURES, local, glob], [MASK, next_local, next_glob]))
+    bb_u = unroll(backbone, hops, [FEATURES], states, [MASK], names)
     return pre_u, bb_u, post_u
 
 
@@ -343,14 +362,23 @@ def zeros(sess):
     return {i.name: np.zeros(i.shape, np.float32) for i in sess.get_inputs()}
 
 
+def run_block(sess, state):
+    output = dict(zip((v.name for v in sess.get_outputs()), sess.run(None, state)))
+    for name in state:
+        next_name = "next_" + name
+        if next_name in output:
+            state[name] = output[next_name]
+    return output
+
+
 def verify(src, stages, hops, seconds=3.0):
-    """Run the three unrolled stages against the original one-hop model."""
+    """Run the unrolled stages against the original one-hop model."""
     import onnxruntime as ort
     rng = np.random.default_rng(1)
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     ref = ort.InferenceSession(src, so, providers=["CPUExecutionProvider"])
-    pre, bb, post = (session(m) for m in stages)
+    pre, *network, post = (session(m) for m in stages)
     n_blocks = int(seconds * 48000 / (hops * HOP))
     t = np.arange(n_blocks * hops * HOP) / 48000
     mono = (0.2 * np.sin(2 * np.pi * 220 * t) + 0.05 * rng.standard_normal(t.size)).astype(np.float32)
@@ -358,7 +386,8 @@ def verify(src, stages, hops, seconds=3.0):
 
     ri = ref.get_inputs()
     rstate = [np.zeros(i.shape, np.float32) for i in ri[1:]]
-    st_pre, st_bb, st_post = zeros(pre), zeros(bb), zeros(post)
+    st_pre, st_post = zeros(pre), zeros(post)
+    network_stages = [(stage, stage.get_inputs()[0].name, zeros(stage)) for stage in network]
     want, got = [], []
     for b in range(n_blocks):
         chunk = audio[:, b * hops * HOP:(b + 1) * hops * HOP]
@@ -369,16 +398,14 @@ def verify(src, stages, hops, seconds=3.0):
             rstate = o[1:]
         blk = np.ascontiguousarray(chunk.reshape(2, hops, HOP).transpose(1, 0, 2))[:, None]  # [hops,1,2,128]
         st_pre["audio"] = blk
-        o = dict(zip([x.name for x in pre.get_outputs()], pre.run(None, st_pre)))
-        st_pre = {k: (o["next_" + k] if "next_" + k in o else v) for k, v in st_pre.items()}
-        st_bb["features"] = o["features"].reshape(st_bb["features"].shape)
-        o2 = dict(zip([x.name for x in bb.get_outputs()], bb.run(None, st_bb)))
-        st_bb = {k: (o2["next_" + k] if "next_" + k in o2 else v) for k, v in st_bb.items()}
-        st_post["mask"] = o2["mask"].reshape(st_post["mask"].shape)
+        output = run_block(pre, st_pre)
+        for stage, name, state in network_stages:
+            state[name] = output[name].reshape(state[name].shape)
+            output = run_block(stage, state)
+        st_post["mask"] = output["mask"].reshape(st_post["mask"].shape)
         st_post["audio"] = blk
-        o3 = dict(zip([x.name for x in post.get_outputs()], post.run(None, st_post)))
-        st_post = {k: (o3["next_" + k] if "next_" + k in o3 else v) for k, v in st_post.items()}
-        got.extend(o3["separated"].reshape(hops, 2, HOP))
+        output = run_block(post, st_post)
+        got.extend(output["separated"].reshape(hops, 2, HOP))
     want, got = np.concatenate(want, 1), np.concatenate(got, 1)
     err = np.sqrt(np.mean((want - got) ** 2)) / (np.sqrt(np.mean(want ** 2)) + 1e-12)
     return 20 * np.log10(err + 1e-20)
@@ -389,16 +416,22 @@ def main():
     ap.add_argument("src")
     ap.add_argument("outdir")
     ap.add_argument("--hops", type=int, default=15)
+    ap.add_argument("--cpu-recurrent", action="store_true", help="keep GRU on CPU and export a stateless HTP decoder")
     args = ap.parse_args()
-    stages = build(args.src, args.hops)
-    ops = sorted({n.op_type for n in stages[1].graph.node})
+    if args.hops < 1 or args.hops > 3 * 48000 // HOP:
+        ap.error("--hops must fit at least one block into the 3-second verification signal")
+    stages = build(args.src, args.hops, cpu_recurrent=args.cpu_recurrent)
+    names = ("vocals_pre", "vocals_core", "vocals_decoder", "vocals_post") if args.cpu_recurrent else (
+        "vocals_pre", "vocals_backbone", "vocals_post"
+    )
+    ops = sorted({n.op_type for n in stages[-2].graph.node})
     err_db = verify(args.src, stages, args.hops)
-    print(f"backbone ops: {ops}")
+    print(f"{names[-2]} ops: {ops}")
     print(f"pipeline x{args.hops} vs original: {err_db:.1f} dB")
-    if err_db > -80:
+    if not np.isfinite(err_db) or err_db > -80:
         sys.exit("conversion changed the model output")
     os.makedirs(args.outdir, exist_ok=True)
-    for name, m in zip(("vocals_pre", "vocals_backbone", "vocals_post"), stages):
+    for name, m in zip(names, stages):
         onnx.save(m, os.path.join(args.outdir, name + ".onnx"))
         size = os.path.getsize(os.path.join(args.outdir, name + ".onnx")) / 1e6
         print(f"  {name}.onnx: {len(m.graph.node)} nodes, {size:.1f} MB")

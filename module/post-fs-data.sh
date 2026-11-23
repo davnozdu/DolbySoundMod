@@ -116,6 +116,20 @@ stage_soundfx() {
             chcon u:object_r:vendor_file:s0 "$STAGE/$f" 2>/dev/null
         fi
     done
+    # The bundled Hexagon V81 runtime was validated on SM8850.
+    QNN_SRC="$MODDIR/vendor/etc/allysound/ally-qnn"
+    if [ -d "$QNN_SRC" ] && [ "$(getprop ro.soc.model)" = "SM8850" ] &&
+       [ ! -f "$DATA_DIR/disable_qnn" ]; then
+        if cp -R "$QNN_SRC" "$STAGE/ally-qnn" &&
+           chmod 0755 "$STAGE/ally-qnn" &&
+           chmod 0644 "$STAGE/ally-qnn/"* &&
+           chcon -R u:object_r:vendor_file:s0 "$STAGE/ally-qnn"; then
+            log "optional QNN runtime staged"
+        else
+            log "QNN staging failed; CPU separator available"
+            rm -rf "$STAGE/ally-qnn"
+        fi
+    fi
     # Optional podcast model dropped in by the user; audioserver cannot read /data/adb.
     if [ -f "$DATA_DIR/speech.onnx" ]; then
         cp -f "$DATA_DIR/speech.onnx" "$STAGE/speech.onnx"

@@ -10,6 +10,11 @@
   - **Музыка (`music`)** — широкая сцена (`RT60 = 0.25s`), без акцента на центр и без компрессии динамики.
   - **Выкл (`off`)** — отключено.
 - **Типы выхода**: `Авто` (определяется по `dumpsys audio`), `Наушники` (HRTF KU100), `Динамики` (CrosstalkWidener + задержка тылов), `Очки` (HRTF + подъём баса `+2 dB`).
+- **Нейросепаратор StemgenRT**: на Qualcomm SM8850 состояние GRU считается на CPU в FP32, а спектральную маску вычисляет Hexagon V81. Если QNN недоступен, сепаратор работает на CPU. [Замеры на OnePlus CPH2745](docs/NPU.md)
+
+## Установка
+
+Скачайте [DolbySoundMod.zip](https://github.com/davnozdu/DolbySoundMod/releases/latest/download/DolbySoundMod.zip), установите модуль в KernelSU и перезагрузите телефон. В WebUI выберите приложение, задайте профиль «Фильм» и включите «Нейросеть».
 
 ## Сборка
 Сборка выполняется автоматически в GitHub Actions (`.github/workflows/build.yml`):
@@ -17,7 +22,7 @@
 2. Клонирование AIDL-определений из AOSP (`android.hardware.audio.effect`, `android.hardware.audio.common`, `android.hardware.common`, `android.hardware.common.fmq`, `android.media.audio.common.types`, `android.media.audio.eraser.types`) и C++-заголовков `libbinder_ndk` (в NDK их нет).
 3. Компиляция AIDL в NDK C++ (`--lang=ndk --stability=vintf --min_sdk_version=35`) и сборка одного самодостаточного `liballysoundaidl.so` (`arm64-v8a`): все сгенерированные единицы трансляции + DSP + эффект, libc++ статически, из внешних зависимостей — только системные `libbinder_ndk`, `liblog`, `libm`, `libdl`, `libc`.
 4. Компиляция `AllySoundCtl.dex`.
-5. Упаковка в готовый `DolbySoundMod.zip` для установки в KernelSU.
+5. Экспорт и проверка графов для QNN, упаковка библиотек и моделей в `DolbySoundMod.zip` для KernelSU.
 
 ## Как эффект попадает в систему
 На устройствах с QTI-прошивкой (OnePlus/Oppo, этот случай) вендорный effect-HAL **не** подхватывает библиотеки, добавленные в `audio_effects*.xml`: он пишет `parseLibrary can't find …` даже про стоковые библиотеки, которые лежат в его же каталоге, и создаёт только то, что вкомпилировано в него или загружено под известным ему именем. Поэтому модуль:
@@ -38,5 +43,4 @@ su -c 'touch /data/adb/allysound/enable_oplus'
 
 Выключить: `rm /data/adb/allysound/enable_oplus` + перезагрузка. Старый флаг `disable_oplus` тоже уважается.
 
-### Известное ограничение (в работе)
-Наш эффект создаётся для сессии приложения и HAL его открывает (`Opened effect … frames=1920`), но audioserver не принимает статус-очередь из `OpenEffectReturn`: `handleSetConfig` возвращает ошибку, клиент не пишет данные (`avail_in=0`), и в лог идёт `invalid efGroup`. Поэтому по умолчанию `apps.conf` пуст (эффект ни к чему не подключается) и звук остаётся стоковым. Дескриптор при этом валиден, если передать его в другой процесс напрямую, — расхождение возникает на пути через binder.
+По умолчанию список приложений пуст. Эффект подключается к сессиям приложений, добавленных в WebUI.

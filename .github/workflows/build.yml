@@ -135,6 +135,37 @@ jobs:
             dsp/test_vocals_split.cpp dsp/vocals.cpp -o test_vocals_split -ldl -pthread
           LD_LIBRARY_PATH=ort-linux/lib ./test_vocals_split models/full/vocals.onnx models/split/vocals.onnx
 
+      - name: Build Hexagon decoder bundle
+        run: |
+          set -euo pipefail
+          BASE=https://repo.maven.apache.org/maven2
+          mkdir -p onnxruntime/qnn models/ally-qnn
+          curl -fsSL --retry 6 --retry-all-errors --retry-delay 15 -o onnxruntime/qnn/ort-qnn.aar \
+            "$BASE/com/microsoft/onnxruntime/onnxruntime-android-qnn/1.25.1/onnxruntime-android-qnn-1.25.1.aar"
+          curl -fsSL --retry 6 --retry-all-errors --retry-delay 15 -o onnxruntime/qnn/qnn-runtime.aar \
+            "$BASE/com/qualcomm/qti/qnn-runtime/2.42.0/qnn-runtime-2.42.0.aar"
+          sha256sum -c - <<'EOF'
+          1b43d86e5b08a43f11f72bac76bedc85e6536fd821f5f6655a9f5ce06ccb9459  onnxruntime/qnn/ort-qnn.aar
+          ecb69bd6a7b1be4717ef10805199fb49ec6b60ca3f481d3068ed9605fba91d5b  onnxruntime/qnn/qnn-runtime.aar
+          EOF
+          unzip -qj onnxruntime/qnn/ort-qnn.aar 'jni/arm64-v8a/libonnxruntime.so' -d models/ally-qnn
+          unzip -qj onnxruntime/qnn/qnn-runtime.aar \
+            'jni/arm64-v8a/libQnnHtp.so' 'jni/arm64-v8a/libQnnHtpPrepare.so' \
+            'jni/arm64-v8a/libQnnHtpV81Skel.so' 'jni/arm64-v8a/libQnnHtpV81Stub.so' \
+            'jni/arm64-v8a/libQnnSystem.so' -d models/ally-qnn
+          python3 tools/make_npu_model.py models/vocals.onnx models/qnn-graphs --cpu-recurrent --hops 15
+          cp models/qnn-graphs/vocals_core.onnx models/qnn-graphs/vocals_decoder.onnx models/ally-qnn/
+
+          mkdir -p onnxruntime/qnn/wheel onnxruntime/qnn/licenses
+          python3 -m pip download --quiet --no-deps --only-binary=:all: \
+            --dest onnxruntime/qnn/wheel onnxruntime==1.25.1
+          LICENSES=onnxruntime/qnn/licenses
+          unzip -p onnxruntime/qnn/wheel/*.whl onnxruntime/LICENSE > "$LICENSES/ONNX-Runtime-LICENSE.txt"
+          unzip -p onnxruntime/qnn/wheel/*.whl onnxruntime/ThirdPartyNotices.txt > "$LICENSES/ONNX-Runtime-QNN-NOTICES.txt"
+          unzip -p ort-java.jar ThirdPartyNotices.txt > "$LICENSES/ONNX-Runtime-CPU-NOTICES.txt"
+          unzip -p onnxruntime/qnn/qnn-runtime.aar LICENSE.pdf > "$LICENSES/Qualcomm-QNN-LICENSE.pdf"
+          unzip -p onnxruntime/qnn/qnn-runtime.aar NOTICE.txt > "$LICENSES/Qualcomm-QNN-NOTICES.txt"
+
       # --min_sdk_version=35 is mandatory: VendorExtension.aidl uses
       # ParcelableHolder, which the NDK backend rejects below SDK 31 and refuses
       # at its 29 default.
@@ -209,8 +240,10 @@ jobs:
       - name: Package KernelSU Module ZIP
         run: |
           set -euo pipefail
-          VER_CODE=$((100 + GITHUB_RUN_NUMBER))
+          # The 1.0.60 device test used code 160.
+          VER_CODE=$((101 + GITHUB_RUN_NUMBER))
           VER_STR="v1.0.${GITHUB_RUN_NUMBER}"
+          printf 'VER_CODE=%s\nVER_STR=%s\n' "$VER_CODE" "$VER_STR" >> "$GITHUB_ENV"
           rm -rf dist DolbySoundMod.zip
           mkdir -p dist/module/vendor/lib64/soundfx dist/module/vendor/etc/allysound dist/module/bin
           cp -r module/. dist/module/
@@ -222,10 +255,16 @@ jobs:
           cp build_arm64/libOplusAudioxAidl.so dist/module/vendor/lib64/soundfx/libOplusAudioxAidl.so
           cp onnxruntime/jni/arm64-v8a/libonnxruntime.so dist/module/vendor/lib64/libonnxruntime.so
           cp models/vocals_backbone.onnx models/vocals_dsp.bin dist/module/vendor/etc/allysound/
+          cp -r models/ally-qnn dist/module/vendor/etc/allysound/
+          cp onnxruntime/qnn/licenses/* dist/module/licenses/
+          cp tools/train/WEIGHTS-LICENSE.md dist/module/licenses/StemgenRT-WEIGHTS-LICENSE.md
+          tar -xOzf tools/train/stemgenrt-0.8.0.tar.gz stemgenrt-0.8.0/licenses/CC-BY-NC-SA-4.0.txt \
+            > dist/module/licenses/CC-BY-NC-SA-4.0.txt
           cp build_java/classes.dex dist/module/bin/AllySoundCtl.dex
           chmod 0755 dist/module/post-fs-data.sh dist/module/service.sh dist/module/uninstall.sh dist/module/bin/check_update.sh
           chmod 0644 dist/module/vendor/lib64/soundfx/liballysoundaidl.so dist/module/vendor/lib64/soundfx/libOplusAudioxAidl.so dist/module/vendor/lib64/libonnxruntime.so dist/module/vendor/etc/allysound/vocals_backbone.onnx dist/module/vendor/etc/allysound/vocals_dsp.bin dist/module/bin/AllySoundCtl.dex
           (cd dist/module && zip -r9 ../../DolbySoundMod.zip .)
+          unzip -tq DolbySoundMod.zip
           unzip -l DolbySoundMod.zip | tail -n 15
 
       - name: Upload Artifact
@@ -239,18 +278,22 @@ jobs:
         with:
           tag_name: v1.0.${{ github.run_number }}
           name: DolbySoundMod v1.0.${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          fail_on_unmatched_files: true
+          body: |
+            Гибридный нейросепаратор для Qualcomm SM8850. Состояние GRU остаётся на CPU в FP32, спектральную маску вычисляет Hexagon V81. При недоступности QNN используется CPU.
+
+            Установите DolbySoundMod.zip в KernelSU, перезагрузите телефон и включите «Нейросеть» для приложения с профилем «Фильм». Проверено на OnePlus CPH2745 с Android 17.
           files: DolbySoundMod.zip
 
       - name: Update update.json on main
         run: |
           set -euo pipefail
-          VER_CODE=$((100 + GITHUB_RUN_NUMBER))
-          VER_STR="v1.0.${GITHUB_RUN_NUMBER}"
           cat > update.json <<EOF
           {
             "version": "${VER_STR}",
             "versionCode": ${VER_CODE},
-            "zipUrl": "https://github.com/davnozdu/DolbySoundMod/releases/latest/download/DolbySoundMod.zip",
+            "zipUrl": "https://github.com/davnozdu/DolbySoundMod/releases/download/${VER_STR}/DolbySoundMod.zip",
             "changelog": "https://raw.githubusercontent.com/davnozdu/DolbySoundMod/main/README.md"
           }
           EOF
