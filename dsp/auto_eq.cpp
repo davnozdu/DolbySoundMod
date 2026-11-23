@@ -47,11 +47,12 @@ constexpr char kStyleGroups[] =
     "0000000000000000004444444444444555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555500000000000000000000000000000000000000000066666666666666666666666666333333333333333333333333300000000000000000000000000000000000000000000000000000000000000000000000000022222212212222221121212222121122121122212222221212222221222222212122212222222212221222112124440";
 static_assert(sizeof(kStyleGroups) == kStyles + 1, "one group per Discogs style");
 constexpr double kPi = 3.14159265358979323846;
-// Battery: classify in short probes, not every window. A probe lasts until the vote
-// is stable (two equal results, plus one MusiCNN pass for music: ~2-5 windows of
-// ~1 s), then the classifier rests for kRestWindows windows (~20 s) before checking
-// the mix again. A changed result inside a probe simply extends the probe.
+// Speech/music (YAMNet) runs every window (~1 s): films and games change between
+// dialogue, music and effects within seconds. The genre (Discogs-EffNet) only matters
+// for the music profile and changes with the track, so after a check it is reused for
+// kRestWindows music windows (~20 s); a check gives up after kMaxGenrePasses unsure passes.
 constexpr int kRestWindows = 20;
+constexpr int kMaxGenrePasses = 4;
 // Release the ONNX sessions (and their HTP context) after this much silence or no audio.
 constexpr float kIdleReleaseSeconds = 10.0f;
 #ifndef ALLY_EQ_MODEL_DIR
@@ -432,7 +433,6 @@ struct AutoEq::Impl {
     void invalidate() {
         ++generation;
         filled = 0;
-        rest.store(0, std::memory_order_relaxed);
     }
 
     void request_release() {
@@ -468,10 +468,16 @@ struct AutoEq::Impl {
         Eq vote = Eq::Neutral;
         int count = 0;
         int silent_windows = 0;
-        bool genre_ran = false;
+        Eq known_genre = Eq::Neutral;   // last confident genre of this stream
+        int genre_rest = 0;             // music windows that reuse known_genre
+        int genre_passes = 0;           // EffNet passes of the current check
         Groups group_sum{};
-        int group_runs = 0;
         const int idle_windows = static_cast<int>(kIdleReleaseSeconds * rate / window.size()) + 1;
+        auto restart_genre = [&] {
+            music.clear();
+            genre_passes = 0;
+            group_sum = {};
+        };
         while (true) {
             uint64_t token;
             {
@@ -482,7 +488,7 @@ struct AutoEq::Impl {
                     // Paused, stopped or switched off: give the memory back.
                     release = false;
                     models.reset();
-                    music.clear();
+                    restart_genre();
                     silent_windows = 0;
                     if (!pending) continue;
                 }
@@ -492,22 +498,25 @@ struct AutoEq::Impl {
             }
             if (token != previous) {
                 previous = token;
-                music.clear();
                 vote = Eq::Neutral;
                 count = 0;
-                genre_ran = false;
-                group_sum = {};
-                group_runs = 0;
+                known_genre = Eq::Neutral;
+                genre_rest = 0;
+                restart_genre();
             }
             const float energy = std::inner_product(window.begin(), window.end(), window.begin(), 0.0f);
             const float rms = std::sqrt(energy / window.size());
-            Eq candidate = Eq::Neutral;
             const bool audible = std::isfinite(rms) && rms >= 1e-5f;
             silent_windows = audible ? 0 : silent_windows + 1;
             if (!audible && silent_windows >= idle_windows) models.reset();
+
+            // Speech or music: every window (~1 s), in every profile. Films and games
+            // change between dialogue, music and effects within seconds.
+            Eq candidate = Eq::Neutral;
+            std::vector<float> mono;
             if (audible) {
                 if (!models) models = acquire_models();
-                auto mono = resampler.convert(window);
+                mono = resampler.convert(window);
                 // AudioFlinger can attenuate samples before the session effect.
                 // Normalize only the analysis copy so playback volume cannot mute classification.
                 const float gain = std::clamp(0.04f / rms, 1.0f, 512.0f);
@@ -515,72 +524,75 @@ struct AutoEq::Impl {
                 yamnet.compute(mono.data(), false);
                 std::array<float, 521> audio_scores{};
                 const int64_t audio_shape[] = {1, 1, 96, 64};
-                if (!models || !models->run(false, yamnet.output, audio_shape, audio_scores)) {
-                    candidate = Eq::Error;
-                } else {
-                    candidate = audio_profile(audio_scores);
-                }
-                if (candidate >= Eq::Music && candidate < Eq::Error) {
-                    if (music.size() == 4) music.pop_front();
-                    music.push_back(std::move(mono));
-                    if (music.size() == 4) {
-                        constexpr int first = 4 * kPatch - kGenreSamples;
-                        auto end = std::copy(music.front().begin() + first, music.front().end(), genre_audio.begin());
-                        for (size_t i = 1; i < music.size(); ++i) end = std::copy(music[i].begin(), music[i].end(), end);
-                        musicnn.compute(genre_audio.data(), true);
-                        // Three overlapping 128-frame patches, laid out as one batch.
-                        for (int patch = 0; patch < kGenrePatches; ++patch) {
-                            std::copy_n(musicnn.output.begin() + patch * kGenrePatchHop * 96,
-                                        kGenrePatchRows * 96, genre_batch.begin() + patch * kGenrePatchRows * 96);
-                        }
-                        std::array<float, kGenrePatches * kStyles> genre_scores{};
-                        const int64_t genre_shape[] = {kGenrePatches, kGenrePatchRows, 96};
-                        genre_ran = true;
-                        if (models->run(true, genre_batch, genre_shape, genre_scores)) {
-                            const Groups current = style_groups(genre_scores);
-                            for (size_t g = 0; g < group_sum.size(); ++g) group_sum[g] += current[g];
-                            ++group_runs;
-                            Groups mean{};
-                            for (size_t g = 0; g < mean.size(); ++g) mean[g] = group_sum[g] / group_runs;
-                            candidate = genre_profile(mean, candidate);
-                        } else {
-                            candidate = Eq::Error;
-                        }
-                    }
-                } else {
-                    music.clear();
-                }
+                candidate = models && models->run(false, yamnet.output, audio_shape, audio_scores)
+                    ? audio_profile(audio_scores) : Eq::Error;
+            }
+
+            // Genre: only for the music profile, and only once per ~20 s of music - a
+            // genre changes with the track, not within seconds.
+            bool pending_genre = false;
+            const bool musical = candidate >= Eq::Music && candidate < Eq::Error;
+            if (!musical) {
+                restart_genre();
+            } else if (!genre_wanted.load(std::memory_order_relaxed)) {
+                candidate = Eq::Music;
+            } else if (genre_rest > 0) {
+                --genre_rest;
+                candidate = known_genre > Eq::Music ? known_genre : Eq::Music;
             } else {
-                music.clear();
+                if (music.size() == 4) music.pop_front();
+                music.push_back(std::move(mono));
+                if (music.size() < 4) {
+                    pending_genre = known_genre <= Eq::Music;
+                    candidate = known_genre > Eq::Music ? known_genre : Eq::Music;
+                } else {
+                    constexpr int first = 4 * kPatch - kGenreSamples;
+                    auto end = std::copy(music.front().begin() + first, music.front().end(), genre_audio.begin());
+                    for (size_t i = 1; i < music.size(); ++i) end = std::copy(music[i].begin(), music[i].end(), end);
+                    musicnn.compute(genre_audio.data(), true);
+                    // Three overlapping 128-frame patches, laid out as one batch.
+                    for (int patch = 0; patch < kGenrePatches; ++patch) {
+                        std::copy_n(musicnn.output.begin() + patch * kGenrePatchHop * 96,
+                                    kGenrePatchRows * 96, genre_batch.begin() + patch * kGenrePatchRows * 96);
+                    }
+                    std::array<float, kGenrePatches * kStyles> genre_scores{};
+                    const int64_t genre_shape[] = {kGenrePatches, kGenrePatchRows, 96};
+                    if (!models->run(true, genre_batch, genre_shape, genre_scores)) {
+                        candidate = Eq::Error;
+                    } else {
+                        // Scores are averaged over the passes of this check, so one
+                        // ambiguous window cannot flip the result.
+                        const Groups current = style_groups(genre_scores);
+                        for (size_t g = 0; g < group_sum.size(); ++g) group_sum[g] += current[g];
+                        ++genre_passes;
+                        Groups mean{};
+                        for (size_t g = 0; g < mean.size(); ++g) mean[g] = group_sum[g] / genre_passes;
+                        const Eq genre = genre_profile(mean, Eq::Music);
+                        if (genre != Eq::Music) known_genre = genre;
+                        // Confident, or unsure after kMaxGenrePasses: rest until the next check.
+                        // An unsure check keeps the genre an earlier one found.
+                        if (genre != Eq::Music || genre_passes >= kMaxGenrePasses) {
+                            genre_rest = kRestWindows;
+                            restart_genre();
+                        } else {
+                            pending_genre = known_genre <= Eq::Music;
+                        }
+                        candidate = known_genre > Eq::Music ? known_genre : Eq::Music;
+                    }
+                }
             }
 #ifdef __ANDROID__
-            __android_log_print(ANDROID_LOG_DEBUG, "AllyAutoEq", "window rms=%.5f candidate=%s",
-                                rms, kNames[static_cast<size_t>(candidate)]);
+            __android_log_print(ANDROID_LOG_DEBUG, "AllyAutoEq", "window rms=%.5f candidate=%s%s",
+                                rms, kNames[static_cast<size_t>(candidate)], pending_genre ? " (genre pending)" : "");
 #endif
+            // Two agreeing windows (~2 s) before the curve moves; the gains then glide
+            // over ~0.65 s. While the first genre check of a music passage runs, the
+            // previous curve stays.
+            if (pending_genre) continue;
             count = candidate == vote ? std::min(count + 1, 2) : 1;
             vote = candidate;
-            // Music only counts once its genre has been checked in this probe: otherwise
-            // the first windows of every probe store plain "music" and flatten the
-            // genre curve for a few seconds every probe.
-            const bool musical = candidate >= Eq::Music && candidate < Eq::Error;
-            if ((count >= 2 && (!musical || genre_ran)) || candidate == Eq::Error) {
-                // An unsure probe ("music" without a confident genre) keeps the genre an
-                // earlier probe found for this stream; only a confident genre replaces it.
-                const uint64_t stored = result.load(std::memory_order_relaxed);
-                const Eq previous_profile = (stored >> 8) == token ? static_cast<Eq>(stored & 255) : Eq::Neutral;
-                const bool keep_genre = candidate == Eq::Music && previous_profile > Eq::Music &&
-                                        previous_profile < Eq::Error;
-                if (!keep_genre) {
-                    result.store((token << 8) | static_cast<uint64_t>(candidate), std::memory_order_relaxed);
-                }
-                if (candidate != Eq::Error) {
-                    rest.store(kRestWindows, std::memory_order_relaxed);
-                    music.clear();          // the next probe needs fresh, contiguous audio
-                    genre_ran = false;
-                    group_sum = {};
-                    group_runs = 0;
-                    count = 0;
-                }
+            if (count >= 2 || candidate == Eq::Error) {
+                result.store((token << 8) | static_cast<uint64_t>(candidate), std::memory_order_relaxed);
             }
         }
     }
@@ -591,7 +603,7 @@ struct AutoEq::Impl {
     uint64_t generation = 1, job_generation = 0;
     std::atomic<uint64_t> result{0};
     bool on = false, pending = false, stopping = false, release = false;
-    std::atomic<int> rest{0};        // windows to skip before the next probe
+    std::atomic<bool> genre_wanted{false};  // music profile: refine music by genre
     float idle_frames = 0.0f;        // audio thread: time without any audio callback
     std::mutex mutex;
     std::condition_variable cv;
@@ -627,8 +639,16 @@ void AutoEq::idle(int frames) {
     if (was_active && state.idle_frames >= kIdleReleaseSeconds * rate_) state.request_release();
 }
 
+void AutoEq::set_genre(bool enabled) {
+    genre_ = enabled;
+    if (impl_) impl_->genre_wanted.store(enabled, std::memory_order_relaxed);
+}
+
 void AutoEq::set_enabled(bool enabled) {
-    if (enabled && !impl_) impl_ = std::make_unique<Impl>(rate_);
+    if (enabled && !impl_) {
+        impl_ = std::make_unique<Impl>(rate_);
+        impl_->genre_wanted.store(genre_, std::memory_order_relaxed);
+    }
     if (!impl_ || impl_->on == enabled) return;
     impl_->invalidate();
     impl_->on = enabled;
@@ -650,10 +670,6 @@ void AutoEq::observe(const float* left, const float* right) {
         state.capture[state.filled++] = 0.5f * (left[i] + right[i]);
         if (state.filled != state.capture.size()) continue;
         state.filled = 0;
-        if (const int r = state.rest.load(std::memory_order_relaxed); r > 0) {
-            state.rest.store(r - 1, std::memory_order_relaxed);
-            continue;
-        }
         std::unique_lock<std::mutex> lock(state.mutex, std::try_to_lock);
         if (!lock || state.pending) continue;
         state.capture.swap(state.job);

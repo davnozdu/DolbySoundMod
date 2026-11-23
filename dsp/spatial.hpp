@@ -196,7 +196,10 @@ public:
     bool neural() const { return neural_; }
     bool reverb() const { return reverb_; }
 #ifdef ALLY_ENABLE_AUTO_EQ
-    void set_auto_eq(bool enabled) { auto_eq_.set_enabled(enabled); }
+    void set_auto_eq(bool enabled) {
+        auto_eq_.set_genre(profile_ == Profile::Music);
+        auto_eq_.set_enabled(enabled);
+    }
     const char* auto_eq_profile() const { return auto_eq_.profile(); }
 #endif
     bool npu_active() const {

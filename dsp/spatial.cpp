@@ -709,6 +709,9 @@ void Renderer::reset() {
 
 void Renderer::set_profile(Profile p) {
     profile_ = p;
+#ifdef ALLY_ENABLE_AUTO_EQ
+    auto_eq_.set_genre(p == Profile::Music);
+#endif
     // Podcast has no room (rt60 0): keep whatever is loaded, it is never mixed in.
     const float rt60 = get_profile_params(p).rt60;
     if (rt60 <= 0.0f || rt60 == room_rt60_) return;
