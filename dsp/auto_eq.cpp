@@ -7,6 +7,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <dlfcn.h>
@@ -24,7 +26,23 @@ namespace ally {
 namespace {
 constexpr int kRate = 16000;
 constexpr int kPatch = 15600;
-constexpr int kGenreSamples = 512 + 186 * 256;
+// Discogs-EffNet (Essentia, 2022): MusiCNN-style mel input, 128-frame patches, 400 Discogs
+// styles. Three patches (hop 56 frames) cover the last ~3.9 s and are averaged.
+constexpr int kGenrePatchRows = 128;
+constexpr int kGenrePatches = 3;
+constexpr int kGenrePatchHop = 56;
+constexpr int kGenreRows = kGenrePatchRows + (kGenrePatches - 1) * kGenrePatchHop;
+constexpr int kGenreSamples = 512 + (kGenreRows - 1) * 256;
+constexpr int kStyles = 400;
+// Decision thresholds on the averaged sigmoid activations (calibrated on labeled clips).
+constexpr float kGenreMinimum = 0.15f;
+constexpr float kGenreMargin = 1.25f;
+// Discogs style -> EQ group, in the model's class order (its metadata "classes"; the
+// model is pinned by SHA-256 in tools/fetch_auto_eq_models.sh): 0 other music, 1 metal,
+// 2 rock, 3 jazz, 4 classical/score/soundtrack, 5 electronic, 6 hip hop.
+constexpr char kStyleGroups[] =
+    "0000000000000000004444444444444555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555500000000000000000000000000000000000000000066666666666666666666666666333333333333333333333333300000000000000000000000000000000000000000000000000000000000000000000000000022222212212222221121212222121122121122212222221212222221222222212122212222222212221222112124440";
+static_assert(sizeof(kStyleGroups) == kStyles + 1, "one group per Discogs style");
 constexpr double kPi = 3.14159265358979323846;
 // Battery: classify in short probes, not every window. A probe lasts until the vote
 // is stable (two equal results, plus one MusiCNN pass for music: ~2-5 windows of
@@ -87,7 +105,7 @@ public:
              std::array<float, N>& scores) {
         const std::lock_guard<std::mutex> lock(mutex_);
         if (genre && !genre_ &&
-            !ok(api_->CreateSession(env_, ALLY_EQ_MODEL_DIR "msd-musicnn-1.onnx", options_, &genre_))) {
+            !open_genre()) {
             return false;
         }
         const char* input_name = genre ? "melspectrogram" : "audio";
@@ -132,6 +150,17 @@ public:
     }
 
 private:
+    // The export has a dynamic batch; pin it to the three patches we always send.
+    bool open_genre() {
+        OrtSessionOptions* opt = nullptr;
+        if (!ok(api_->CloneSessionOptions(options_, &opt))) return false;
+        const bool ready = ok(api_->AddFreeDimensionOverrideByName(opt, "batch_size", kGenrePatches)) &&
+                           ok(api_->CreateSession(env_, ALLY_EQ_MODEL_DIR "discogs-effnet-bsdynamic-1.onnx",
+                                                  opt, &genre_));
+        api_->ReleaseSessionOptions(opt);
+        return ready;
+    }
+
     void enable_qnn() {
         OrtSessionOptions* opt = nullptr;
         if (!ok(api_->CloneSessionOptions(options_, &opt))) return;
@@ -196,7 +225,7 @@ std::shared_ptr<Models> acquire_models() {
 struct Features {
     explicit Features(bool genre)
         : frame_size(genre ? 512 : 400), step(genre ? 256 : 160),
-          rows(genre ? 187 : 96), bands(genre ? 96 : 64),
+          rows(genre ? kGenreRows : 96), bands(genre ? 96 : 64),
           mel(257 * bands), output(rows * bands) {
         for (int i = 0; i < frame_size; ++i) {
             window[i] = 0.5 - 0.5 * std::cos(2 * kPi * i / (genre ? frame_size - 1 : frame_size));
@@ -315,15 +344,40 @@ Eq audio_profile(std::array<float, 521>& scores) {
            ? top.profile : Eq::Music;
 }
 
-Eq genre_profile(const std::array<float, 50>& scores, Eq fallback) {
-    std::array<Tag, 5> tags{{
-        {Eq::Rock, peak(scores, {0, 8, 14, 16, 24, 27, 43})}, {Eq::Metal, peak(scores, {11, 42})},
-        {Eq::Jazz, scores[9]}, {Eq::Electronic, peak(scores, {4, 18, 41, 48})},
-        {Eq::HipHop, scores[33]},
+using Groups = std::array<float, 7>;
+
+// Average the patches, then score each EQ group by its strongest style.
+Groups style_groups(const std::array<float, kGenrePatches * kStyles>& scores) {
+    Groups group{};
+    for (int style = 0; style < kStyles; ++style) {
+        float mean = 0.0f;
+        for (int patch = 0; patch < kGenrePatches; ++patch) mean += scores[patch * kStyles + style];
+        mean /= kGenrePatches;
+        const int g = kStyleGroups[style] - '0';
+        group[g] = std::max(group[g], mean);
+    }
+    return group;
+}
+
+// Decides on the group scores averaged over every genre pass of the current probe, so
+// one ambiguous window cannot flip the result.
+Eq genre_profile(const Groups& group, Eq fallback) {
+#ifndef __ANDROID__
+    if (std::getenv("ALLY_EQ_DEBUG")) {
+        std::fprintf(stderr, "genre groups: other %.2f metal %.2f rock %.2f jazz %.2f classical %.2f "
+                     "electronic %.2f hiphop %.2f\n", group[0], group[1], group[2], group[3], group[4],
+                     group[5], group[6]);
+    }
+#endif
+    std::array<Tag, 6> tags{{
+        {Eq::Metal, group[1]}, {Eq::Rock, group[2]}, {Eq::Jazz, group[3]},
+        {Eq::Classical, group[4]}, {Eq::Electronic, group[5]}, {Eq::HipHop, group[6]},
     }};
     const auto top = best_tag(tags);
-    const float competitor = std::max(tags[1].score, peak(scores, {1, 15, 20, 26, 36, 40, 45, 46}));
-    return top.score >= 0.26f && top.score > competitor + 0.09f ? top.profile : fallback;
+    // Metal styles also light up rock; let a clear metal score win over its parent.
+    if (top.profile == Eq::Rock && group[1] >= kGenreMinimum && group[1] >= 0.6f * group[2]) return Eq::Metal;
+    const float competitor = std::max(tags[1].score, group[0]);
+    return top.score >= kGenreMinimum && top.score > competitor * kGenreMargin ? top.profile : fallback;
 }
 
 } // namespace
@@ -386,16 +440,19 @@ struct AutoEq::Impl {
         setpriority(PRIO_PROCESS, 0, 5);
 #endif
         Resampler resampler(rate);
-        Features yamnet(false), musicnn(true);
+        Features yamnet(false), musicnn(true);  // musicnn: the MusiCNN-style mel input EffNet uses
         std::shared_ptr<Models> models;
         std::vector<float> window(std::ceil(kPatch * rate / kRate));
         std::deque<std::vector<float>> music;
         std::array<float, kGenreSamples> genre_audio{};
+        std::vector<float> genre_batch(kGenrePatches * kGenrePatchRows * 96);
         uint64_t previous = 0;
         Eq vote = Eq::Neutral;
         int count = 0;
         int silent_windows = 0;
         bool genre_ran = false;
+        Groups group_sum{};
+        int group_runs = 0;
         const int idle_windows = static_cast<int>(kIdleReleaseSeconds * rate / window.size()) + 1;
         while (true) {
             uint64_t token;
@@ -421,6 +478,8 @@ struct AutoEq::Impl {
                 vote = Eq::Neutral;
                 count = 0;
                 genre_ran = false;
+                group_sum = {};
+                group_runs = 0;
             }
             const float energy = std::inner_product(window.begin(), window.end(), window.begin(), 0.0f);
             const float rms = std::sqrt(energy / window.size());
@@ -451,11 +510,21 @@ struct AutoEq::Impl {
                         auto end = std::copy(music.front().begin() + first, music.front().end(), genre_audio.begin());
                         for (size_t i = 1; i < music.size(); ++i) end = std::copy(music[i].begin(), music[i].end(), end);
                         musicnn.compute(genre_audio.data(), true);
-                        std::array<float, 50> genre_scores{};
-                        const int64_t genre_shape[] = {1, 187, 96};
+                        // Three overlapping 128-frame patches, laid out as one batch.
+                        for (int patch = 0; patch < kGenrePatches; ++patch) {
+                            std::copy_n(musicnn.output.begin() + patch * kGenrePatchHop * 96,
+                                        kGenrePatchRows * 96, genre_batch.begin() + patch * kGenrePatchRows * 96);
+                        }
+                        std::array<float, kGenrePatches * kStyles> genre_scores{};
+                        const int64_t genre_shape[] = {kGenrePatches, kGenrePatchRows, 96};
                         genre_ran = true;
-                        if (models->run(true, musicnn.output, genre_shape, genre_scores)) {
-                            candidate = genre_profile(genre_scores, candidate);
+                        if (models->run(true, genre_batch, genre_shape, genre_scores)) {
+                            const Groups current = style_groups(genre_scores);
+                            for (size_t g = 0; g < group_sum.size(); ++g) group_sum[g] += current[g];
+                            ++group_runs;
+                            Groups mean{};
+                            for (size_t g = 0; g < mean.size(); ++g) mean[g] = group_sum[g] / group_runs;
+                            candidate = genre_profile(mean, candidate);
                         } else {
                             candidate = Eq::Error;
                         }
@@ -477,11 +546,21 @@ struct AutoEq::Impl {
             // genre curve for a few seconds every probe.
             const bool musical = candidate >= Eq::Music && candidate < Eq::Error;
             if ((count >= 2 && (!musical || genre_ran)) || candidate == Eq::Error) {
-                result.store((token << 8) | static_cast<uint64_t>(candidate), std::memory_order_relaxed);
+                // An unsure probe ("music" without a confident genre) keeps the genre an
+                // earlier probe found for this stream; only a confident genre replaces it.
+                const uint64_t stored = result.load(std::memory_order_relaxed);
+                const Eq previous_profile = (stored >> 8) == token ? static_cast<Eq>(stored & 255) : Eq::Neutral;
+                const bool keep_genre = candidate == Eq::Music && previous_profile > Eq::Music &&
+                                        previous_profile < Eq::Error;
+                if (!keep_genre) {
+                    result.store((token << 8) | static_cast<uint64_t>(candidate), std::memory_order_relaxed);
+                }
                 if (candidate != Eq::Error) {
                     rest.store(kRestWindows, std::memory_order_relaxed);
                     music.clear();          // the next probe needs fresh, contiguous audio
                     genre_ran = false;
+                    group_sum = {};
+                    group_runs = 0;
                     count = 0;
                 }
             }
