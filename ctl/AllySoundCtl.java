@@ -345,7 +345,10 @@ public class AllySoundCtl {
             if (state != PLAYER_STATE_STARTED) continue;
             int sid = (Integer) type.getMethod("getSessionId").invoke(config);
             int pid = (Integer) type.getMethod("getClientPid").invoke(config);
-            if (sid <= 0 || pid <= 0) continue;
+            // An anonymized list (pid -1 for a playing track) is useless: let the
+            // caller fall back to dumpsys for good.
+            if (pid <= 0) throw new IllegalStateException("anonymized playback configs");
+            if (sid <= 0) continue;
             String pkg = packageOfPid(pid);
             if (pkg != null && pkg.contains(".") && !sessions.containsKey(sid)) {
                 sessions.put(sid, pkg);
