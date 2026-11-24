@@ -22,8 +22,13 @@ curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 300 -o "
     https://qaihub-public-assets.s3.us-west-2.amazonaws.com/qai-hub-models/models/yamnet/releases/v0.59.0/yamnet-onnx-float.zip
 verify bda628207418bc59b6a371aef6180b53367707eaf7b8b8a7c683417000d1eea4 "$temp/yamnet.zip"
 unzip -jq "$temp/yamnet.zip" 'yamnet-onnx-float/yamnet.onnx' 'yamnet-onnx-float/yamnet.data' -d "$temp"
-curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 300 -o "$temp/discogs-effnet-bsdynamic-1.onnx" \
-    https://essentia.upf.edu/models/feature-extractors/discogs-effnet/discogs-effnet-bsdynamic-1.onnx
+# essentia.upf.edu is sometimes unreachable for hours; the mirror is an unmodified copy
+# in this repository's "models-auto-eq" release. Either way the SHA-256 below decides.
+effnet=discogs-effnet-bsdynamic-1.onnx
+curl -fsSL --retry 2 --retry-all-errors --connect-timeout 20 --max-time 300 -o "$temp/$effnet" \
+    "https://essentia.upf.edu/models/feature-extractors/discogs-effnet/$effnet" ||
+curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 300 -o "$temp/$effnet" \
+    "https://github.com/davnozdu/DolbySoundMod/releases/download/models-auto-eq/$effnet"
 verify a280825b334797cf677939db8cd5762c0392aedd0ca6415dbc1cd083f045e43c "$temp/discogs-effnet-bsdynamic-1.onnx"
 mkdir -p "$dest"
 # The HTP rejects the export's Identity (it only feeds the unused embeddings output).
