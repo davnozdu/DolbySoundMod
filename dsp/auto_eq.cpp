@@ -42,9 +42,11 @@ constexpr float kGenreMinimum = 0.15f;
 constexpr float kGenreMargin = 1.25f;
 // Discogs style -> EQ group, in the model's class order (its metadata "classes"; the
 // model is pinned by SHA-256 in tools/fetch_auto_eq_models.sh): 0 other music, 1 metal,
-// 2 rock, 3 jazz, 4 classical/score/soundtrack, 5 electronic, 6 hip hop.
+// 2 rock, 3 jazz, 4 classical and film score, 5 electronic, 6 hip hop. Soundtrack and
+// Musical count as other music: pop songs with orchestral or cinematic production
+// score highest on Soundtrack and were equalized as classical.
 constexpr char kStyleGroups[] =
-    "0000000000000000004444444444444555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555500000000000000000000000000000000000000000066666666666666666666666666333333333333333333333333300000000000000000000000000000000000000000000000000000000000000000000000000022222212212222221121212222121122121122212222221212222221222222212122212222222212221222112124440";
+    "0000000000000000004444444444444555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555500000000000000000000000000000000000000000066666666666666666666666666333333333333333333333333300000000000000000000000000000000000000000000000000000000000000000000000000022222212212222221121212222121122121122212222221212222221222222212122212222222212221222112120400";
 static_assert(sizeof(kStyleGroups) == kStyles + 1, "one group per Discogs style");
 constexpr double kPi = 3.14159265358979323846;
 // Speech/music (YAMNet) runs every window (~1 s): films and games change between
@@ -568,6 +570,25 @@ struct AutoEq::Impl {
                         Groups mean{};
                         for (size_t g = 0; g < mean.size(); ++g) mean[g] = group_sum[g] / genre_passes;
                         const Eq genre = genre_profile(mean, Eq::Music);
+                        {
+                            // Diagnostics: group means and this pass's three strongest
+                            // styles (indices into the model's "classes").
+                            std::array<std::pair<float, int>, kStyles> ranked{};
+                            for (int style = 0; style < kStyles; ++style) {
+                                float m = 0.0f;
+                                for (int patch = 0; patch < kGenrePatches; ++patch) m += genre_scores[patch * kStyles + style];
+                                ranked[style] = {m / kGenrePatches, style};
+                            }
+                            std::partial_sort(ranked.begin(), ranked.begin() + 3, ranked.end(),
+                                              [](auto x, auto y) { return x.first > y.first; });
+#ifdef __ANDROID__
+                            __android_log_print(ANDROID_LOG_DEBUG, "AllyAutoEq", "genre pass %d: other %.2f metal %.2f rock %.2f jazz %.2f "
+                                "classical %.2f electronic %.2f hiphop %.2f; top styles %d:%.2f %d:%.2f %d:%.2f -> %s",
+                                genre_passes, mean[0], mean[1], mean[2], mean[3], mean[4], mean[5], mean[6],
+                                ranked[0].second, ranked[0].first, ranked[1].second, ranked[1].first,
+                                ranked[2].second, ranked[2].first, kNames[static_cast<size_t>(genre)]);
+#endif
+                        }
                         if (genre != Eq::Music) known_genre = genre;
                         // Confident, or unsure after kMaxGenrePasses: rest until the next check.
                         // An unsure check keeps the genre an earlier one found.

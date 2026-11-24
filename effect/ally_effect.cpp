@@ -160,8 +160,8 @@ public:
     ndk::ScopedAStatus open(const Parameter::Common& common,
                             const std::optional<Parameter::Specific>& specific,
                             OpenEffectReturn* _aidl_return) override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        stop_worker_locked();
+        std::unique_lock<std::mutex> lock(mutex_);
+        stop_worker_locked(lock);
 
         common_ = common;
         sample_rate_ = static_cast<float>(common.input.base.sampleRate > 0 ? common.input.base.sampleRate : 48000);
@@ -218,8 +218,8 @@ public:
     }
 
     ndk::ScopedAStatus close() override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        stop_worker_locked();
+        std::unique_lock<std::mutex> lock(mutex_);
+        stop_worker_locked(lock);
         status_mq_.reset();
         in_mq_.reset();
         out_mq_.reset();
@@ -416,8 +416,8 @@ private:
     }
 
     void stop_worker() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        stop_worker_locked();
+        std::unique_lock<std::mutex> lock(mutex_);
+        stop_worker_locked(lock);
     }
 
     // Wake mask for incoming audio on statusMQ's event flag: covers V1 (bit 0 = 0x01)
@@ -425,12 +425,19 @@ private:
     // ourselves for statusMQ->readBlocking().
     static constexpr uint32_t kEventFlagDataMqNotEmpty = (1u << 0) | (1u << 2) | (1u << 3) | (1u << 4);
 
-    void stop_worker_locked() {
+    // Joins the worker with `lock` released: the worker takes mutex_ for every block
+    // and for idle accounting, so joining while holding it deadlocked close() (the
+    // audio HAL then hung until audioserver's TimeCheck aborted it). Callers hold
+    // `lock` on entry and on return.
+    void stop_worker_locked(std::unique_lock<std::mutex>& lock) {
         if (worker_running_.exchange(false)) {
             status_mq_.wake(kEventFlagDataMqNotEmpty);
             in_mq_.wake(0x02);
-            if (worker_.joinable()) {
-                worker_.join();
+            std::thread worker = std::move(worker_);
+            if (worker.joinable()) {
+                lock.unlock();
+                worker.join();
+                lock.lock();
             }
         }
     }
