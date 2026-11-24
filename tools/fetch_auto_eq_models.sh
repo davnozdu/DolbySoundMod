@@ -18,11 +18,11 @@ verify() {
     fi
 }
 
-curl -fsSL --retry 3 -o "$temp/yamnet.zip" \
+curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 300 -o "$temp/yamnet.zip" \
     https://qaihub-public-assets.s3.us-west-2.amazonaws.com/qai-hub-models/models/yamnet/releases/v0.59.0/yamnet-onnx-float.zip
 verify bda628207418bc59b6a371aef6180b53367707eaf7b8b8a7c683417000d1eea4 "$temp/yamnet.zip"
 unzip -jq "$temp/yamnet.zip" 'yamnet-onnx-float/yamnet.onnx' 'yamnet-onnx-float/yamnet.data' -d "$temp"
-curl -fsSL --retry 3 -o "$temp/discogs-effnet-bsdynamic-1.onnx" \
+curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 300 -o "$temp/discogs-effnet-bsdynamic-1.onnx" \
     https://essentia.upf.edu/models/feature-extractors/discogs-effnet/discogs-effnet-bsdynamic-1.onnx
 verify a280825b334797cf677939db8cd5762c0392aedd0ca6415dbc1cd083f045e43c "$temp/discogs-effnet-bsdynamic-1.onnx"
 mkdir -p "$dest"
