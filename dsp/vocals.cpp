@@ -33,7 +33,9 @@ namespace {
 
 constexpr int kHop = PipelinedVocals::kHop;
 constexpr int kQnnHops = 15;
-constexpr int kQnnMarginHops = 10;
+// Batches of 15 run in ~17 ms (max ~25) against a 40 ms callback; 4 hops (~11 ms)
+// of margin kept misses at zero on the phone, 10 only added latency.
+constexpr int kQnnMarginHops = 4;
 using HopBuf = std::array<float, 2 * kHop>;
 
 struct QueuedHop {
@@ -408,8 +410,6 @@ struct PipelinedVocals::Impl {
     // Audio-thread only.
     float wet = 0.0f;
     int cooldown = 0;
-    std::vector<float> fallback_buf; // (1 + kMaxDelayHops) * 2 * kHop
-    size_t fallback_pos = 0;
 
     std::atomic<uint32_t> stat_hops{0};
     std::atomic<uint32_t> stat_misses{0};
@@ -720,7 +720,6 @@ void PipelinedVocals::load(bool use_npu) {
     }
     for (const auto& n : m->input_names) d->in_names.push_back(n.c_str());
     for (const auto& n : m->output_names) d->out_names.push_back(n.c_str());
-    d->fallback_buf.assign((1 + kMaxDelayHops) * 2 * kHop, 0.0f);
 
     // Warm up (first Run allocates kernels and caches).
     HopBuf zeros{}, d_tmp{}, r_tmp{};
@@ -747,7 +746,11 @@ void PipelinedVocals::load(bool use_npu) {
 void PipelinedVocals::note_block_frames(int frames) {
     const int hops = std::max(1, (frames + kHop - 1) / kHop);
     int requested = hops + kMarginHops;
-    if (ready_.load() && impl_->batched) {
+    // Size the delay for the Hexagon batch from the first block when its bundle is
+    // installed: growing it later (when the model is ready) means a gap of silence
+    // in running audio, which the vendor HAL then fades back in over 100 ms.
+    static const bool qnn_installed = access("/vendor/lib64/soundfx/ally-qnn/libonnxruntime.so", R_OK) == 0;
+    if (qnn_installed || (ready_.load() && impl_->batched)) {
         // A batch may start mid-callback after a silent interval or pipeline resync,
         // even when both lengths are equal.
         requested = hops + kQnnHops - 1 + kQnnMarginHops;
@@ -829,8 +832,27 @@ void PipelinedVocals::passive_matrix(const float* dry, float* rest) {
 }
 
 void PipelinedVocals::process(const float* stereo_in, float* dry_out, float* rest_out, uint64_t tick) {
+    // The delay line belongs to this object, not to the loaded model: audio runs
+    // through it from the very first block, while the model loads in the
+    // background, so the moment it becomes ready the output does not jump in time.
+    const size_t delay_hops = static_cast<size_t>(delay_hops_);
+    const size_t ring = 1 + delay_hops;
+    if (delay_buf_.empty()) delay_buf_.assign((1 + kMaxDelayHops) * 2 * kHop, 0.0f);
+    if (ring != delay_ring_ || (delay_tick_ != UINT64_MAX && tick != delay_tick_ + 1)) {
+        std::fill(delay_buf_.begin(), delay_buf_.end(), 0.0f);
+        delay_pos_ = 0;
+        delay_ring_ = ring;
+    }
+    delay_tick_ = tick;
+    HopBuf dry_ref;
+    float* slot = &delay_buf_[delay_pos_ * 2 * kHop];
+    std::memcpy(dry_ref.data(), slot, 2 * kHop * sizeof(float));
+    std::memcpy(slot, stereo_in, 2 * kHop * sizeof(float));
+    delay_pos_ = (delay_pos_ + 1) % ring;
+
     if (!ready_.load() || !impl_) {
-        std::memcpy(dry_out, stereo_in, 2 * kHop * sizeof(float));
+        // Still loading (or failed): the passive matrix, already on the model's delay.
+        std::memcpy(dry_out, dry_ref.data(), 2 * kHop * sizeof(float));
         passive_matrix(dry_out, rest_out);
         return;
     }
@@ -844,7 +866,6 @@ void PipelinedVocals::process(const float* stereo_in, float* dry_out, float* res
         return;
     }
     d->stat_hops.fetch_add(1, std::memory_order_relaxed);
-    const size_t delay_hops = static_cast<size_t>(delay_hops_);
 
     uint64_t cur_gen, cur_seq;
     {
@@ -862,8 +883,6 @@ void PipelinedVocals::process(const float* stereo_in, float* dry_out, float* res
             d->seq = 0;
             d->inbox.clear();
             d->outbox.clear();
-            std::fill(d->fallback_buf.begin(), d->fallback_buf.end(), 0.0f);
-            d->fallback_pos = 0;
             d->wet = 0.0f;
             delay_changed_ = false;
         }
@@ -876,15 +895,6 @@ void PipelinedVocals::process(const float* stereo_in, float* dry_out, float* res
         std::memcpy(q.audio.data(), stereo_in, 2 * kHop * sizeof(float));
     }
     d->cv.notify_one();
-
-    // Fallback delay line: the passive path is delayed exactly like the model path,
-    // so switching between them never jumps in time.
-    const size_t ring = 1 + delay_hops;
-    float* slot = &d->fallback_buf[d->fallback_pos * 2 * kHop];
-    HopBuf dry_ref;
-    std::memcpy(dry_ref.data(), slot, 2 * kHop * sizeof(float));
-    std::memcpy(slot, stereo_in, 2 * kHop * sizeof(float));
-    d->fallback_pos = (d->fallback_pos + 1) % ring;
 
     if (cur_seq < ring) {
         std::memcpy(dry_out, dry_ref.data(), 2 * kHop * sizeof(float));

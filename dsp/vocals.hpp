@@ -42,6 +42,7 @@ public:
     bool ensure_loaded(const char* model_path, bool use_npu = true);
     bool is_ready() const { return ready_.load(); }
     bool using_npu() const { return npu_active_.load(); }
+    bool failed() const { return failed_.load(); }
 
     // Tells the pipeline how many frames the host delivers per call so the delay
     // can cover a whole block. Call from the audio thread before process().
@@ -71,6 +72,12 @@ private:
     // Audio-thread only.
     int delay_hops_ = kMinDelayHops;
     bool delay_changed_ = false;
+    // Delay line for the dry/passive path (audio thread only), alive across model
+    // loads and unloads.
+    std::vector<float> delay_buf_;
+    size_t delay_pos_ = 0;
+    size_t delay_ring_ = 0;
+    uint64_t delay_tick_ = UINT64_MAX;
     int silent_hops_ = 0;
 
     void unload();

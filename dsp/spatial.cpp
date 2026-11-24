@@ -768,8 +768,12 @@ void Renderer::make_stereo_feeds(bool& has_lfe) {
     if (neural_ && (profile_ == Profile::Speech || profile_ == Profile::Movie)) {
         vocals_.note_hop(&block_[0]);
     }
+    // The separator path is taken from the first block, not once the model is ready:
+    // it carries its delay line and plays the passive matrix while the model loads in
+    // the background, so readiness changes nothing audible. Only a failed load falls
+    // back to the undelayed path below.
     if (neural_ && profile_ == Profile::Speech &&
-        vocals_.ensure_loaded(speech_model_path(), true)) {
+        (vocals_.ensure_loaded(speech_model_path(), true) || !vocals_.failed())) {
         // Speech model: keep the voice, tuck everything else away. No room, no air -
         // the stereo path below only has to place it.
         std::array<float, 2 * kHop> dry{};
@@ -781,7 +785,7 @@ void Renderer::make_stereo_feeds(bool& has_lfe) {
         }
     }
     if (neural_ && profile_ == Profile::Movie &&
-        vocals_.ensure_loaded(vocals_model_path(), true)) {
+        (vocals_.ensure_loaded(vocals_model_path(), true) || !vocals_.failed())) {
         constexpr float kVoiceToCentre = 0.75f;
         std::array<float, 2 * kHop> dry{};
         std::array<float, 2 * kHop> sep_rest{};

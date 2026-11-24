@@ -1,4 +1,5 @@
 import android.media.audiofx.AudioEffect;
+import android.os.IBinder;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
@@ -11,6 +12,7 @@ import java.nio.channels.FileLock;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -40,6 +42,8 @@ public class AllySoundCtl {
 
     private static final Map<Integer, SessionEffect> active = new HashMap<>();
     private static final Map<Integer, Long> failedAt = new HashMap<>();
+    private static final Map<Integer, Long> lastSeen = new HashMap<>();
+    private static final long SESSION_GRACE_MS = 15000;
 
     private static int parseProfile(String s) {
         if (s == null) return 0;
@@ -315,6 +319,41 @@ public class AllySoundCtl {
         return sessions;
     }
 
+    // Fast path: ask the audio service for its playback configurations over binder.
+    // One call costs well under a millisecond, against 40-90 ms for `dumpsys audio`,
+    // so new playbacks can be picked up every 250 ms and the effect attaches within
+    // a fraction of a second of the track starting.
+    private static Object audioService;
+    private static Method getPlaybackConfigs;
+    private static boolean fastSessionsBroken;
+    private static final int PLAYER_STATE_STARTED = 2;
+
+    private static Map<Integer, String> readSessionsFast() throws Exception {
+        if (getPlaybackConfigs == null) {
+            Class<?> serviceManager = Class.forName("android.os.ServiceManager");
+            IBinder binder = (IBinder) serviceManager.getMethod("getService", String.class).invoke(null, "audio");
+            Class<?> stub = Class.forName("android.media.IAudioService$Stub");
+            audioService = stub.getMethod("asInterface", IBinder.class).invoke(null, binder);
+            getPlaybackConfigs = audioService.getClass().getMethod("getActivePlaybackConfigurations");
+        }
+        Map<Integer, String> sessions = new HashMap<>();
+        List<?> configs = (List<?>) getPlaybackConfigs.invoke(audioService);
+        if (configs == null) return sessions;
+        for (Object config : configs) {
+            Class<?> type = config.getClass();
+            int state = (Integer) type.getMethod("getPlayerState").invoke(config);
+            if (state != PLAYER_STATE_STARTED) continue;
+            int sid = (Integer) type.getMethod("getSessionId").invoke(config);
+            int pid = (Integer) type.getMethod("getClientPid").invoke(config);
+            if (sid <= 0 || pid <= 0) continue;
+            String pkg = packageOfPid(pid);
+            if (pkg != null && pkg.contains(".") && !sessions.containsKey(sid)) {
+                sessions.put(sid, pkg);
+            }
+        }
+        return sessions;
+    }
+
     private static AudioEffect createAllyEffect(int sessionId) throws Exception {
         Constructor<AudioEffect> ctor = AudioEffect.class.getDeclaredConstructor(
             UUID.class, UUID.class, int.class, int.class);
@@ -380,32 +419,69 @@ public class AllySoundCtl {
             // lock is best effort; never block the controller
         }
         String lastError = null;
+        // Sessions are polled every 250 ms over binder; settings, the output device
+        // (`dumpsys audio`) and the status file are refreshed every 1.5 s.
+        long tick = 0;
+        Map<String, Integer> apps = null;
+        int device = 0, neural = 0, reverb = 0, upmix = 0, autoEq = 0;
         while (true) {
             try {
-                Map<String, Integer> apps = readAppsConf();
-                String devMode = readDeviceMode();
-                int device = detectOutputDevice(devMode);
-                int neural = readNeuralEnabled();
-                int reverb = readReverbEnabled();
-                int upmix = readToggle(UPMIX_CONF);
-                int autoEq = readToggle(AUTO_EQ_CONF);
-                Map<Integer, String> sessions = readActiveSessions();
+                final boolean refresh = tick++ % 6 == 0 || apps == null;
+                if (refresh) {
+                    apps = readAppsConf();
+                    device = detectOutputDevice(readDeviceMode());
+                    neural = readNeuralEnabled();
+                    reverb = readReverbEnabled();
+                    upmix = readToggle(UPMIX_CONF);
+                    autoEq = readToggle(AUTO_EQ_CONF);
+                }
+                Map<Integer, String> sessions = null;
+                if (!fastSessionsBroken) {
+                    try {
+                        sessions = readSessionsFast();
+                    } catch (Throwable t) {
+                        fastSessionsBroken = true;   // fall back to dumpsys for good
+                    }
+                }
+                if (sessions == null) {
+                    if (!refresh) {
+                        Thread.sleep(250);
+                        continue;
+                    }
+                    sessions = readActiveSessions();
+                }
 
-                // Remove stale or disabled sessions
+                // Remove stale or disabled sessions. A session that merely stopped
+                // playing (pause, the gap between two tracks) keeps its effect for
+                // SESSION_GRACE_MS, so resuming or the next track does not attach a
+                // new effect and start it from scratch.
+                final long now = System.currentTimeMillis();
+                for (int sid : sessions.keySet()) lastSeen.put(sid, now);
                 Iterator<Map.Entry<Integer, SessionEffect>> it = active.entrySet().iterator();
                 while (it.hasNext()) {
                     Map.Entry<Integer, SessionEffect> entry = it.next();
                     int sid = entry.getKey();
                     SessionEffect se = entry.getValue();
                     String pkg = sessions.get(sid);
+                    if (pkg == null) {
+                        Long seen = lastSeen.get(sid);
+                        if (seen != null && now - seen < SESSION_GRACE_MS && apps.get(se.pkg) != null) continue;
+                    }
                     Integer wantedProf = (pkg != null) ? apps.get(pkg) : null;
                     if (pkg == null || wantedProf == null || wantedProf == 0) {
+                        lastSeen.remove(sid);
                         try {
                             se.effect.setEnabled(false);
                             se.effect.release();
                         } catch (Exception ignored) {}
                         it.remove();
                     }
+                }
+
+                Iterator<Map.Entry<Integer, Long>> seenIt = lastSeen.entrySet().iterator();
+                while (seenIt.hasNext()) {
+                    Map.Entry<Integer, Long> seen = seenIt.next();
+                    if (now - seen.getValue() > SESSION_GRACE_MS && !active.containsKey(seen.getKey())) seenIt.remove();
                 }
 
                 // Attach or update matching sessions
@@ -457,14 +533,14 @@ public class AllySoundCtl {
                         }
                     }
                 }
-                writeStatus(device, lastError);
+                if (refresh) writeStatus(device, lastError);
             } catch (Exception e) {
                 lastError = e.getMessage();
                 writeStatus(0, lastError);
             }
 
             try {
-                Thread.sleep(1500);
+                Thread.sleep(250);
             } catch (InterruptedException ignored) {
                 break;
             }
