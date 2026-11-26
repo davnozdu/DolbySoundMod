@@ -175,6 +175,7 @@ public:
         renderer_.set_neural(neural_.load());
         renderer_.set_reverb(reverb_.load());
         renderer_.set_upmix(upmix_.load());
+        renderer_.set_scene_adapter(scene_adapter_.load());
         renderer_.set_auto_eq(auto_eq_.load());
 
         if (specific.has_value()) {
@@ -322,6 +323,7 @@ private:
     std::atomic<bool> neural_{false};
     std::atomic<bool> reverb_{true};
     std::atomic<bool> upmix_{false};
+    std::atomic<bool> scene_adapter_{false};
     std::atomic<bool> auto_eq_{false};
     std::atomic<bool> worker_running_{false};
     std::thread worker_;
@@ -350,8 +352,10 @@ private:
                 return;
             }
             int32_t val = le.get<LoudnessEnhancer::Tag::gainMb>();
-            if (val >= 50000 && val < 90000) {
+            if (val >= 50000 && val < 130000) {
                 const int flags = (val - 50000) / 10000;
+                scene_adapter_.store((flags & 4) != 0);
+                renderer_.set_scene_adapter(scene_adapter_.load());
                 auto_eq_.store((flags & 2) != 0);
                 renderer_.set_auto_eq(auto_eq_.load());
                 val = 30000 + (flags & 1) * 10000 + (val - 50000) % 10000;
@@ -384,8 +388,8 @@ private:
                     device_.store(dev);
                     renderer_.set_device(dev);
                 }
-                ALOGI("Updated params: profile=%d neural=%d reverb=%d device=%d upmix=%d auto_eq=%d",
-                      p, n, r, d, (int)upmix_.load(), (int)auto_eq_.load());
+                ALOGI("Updated params: profile=%d neural=%d reverb=%d device=%d upmix=%d auto_eq=%d scene=%d",
+                      p, n, r, d, (int)upmix_.load(), (int)auto_eq_.load(), (int)scene_adapter_.load());
             } else if (val >= 10000 && val < 11000) {
                 // Older encoding without the reverb digit, kept so an app that still
                 // writes the four-digit code does not lose its settings.
@@ -541,12 +545,13 @@ private:
             stat_proc_us += std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_proc0).count();
             if (std::chrono::duration_cast<std::chrono::milliseconds>(t_end - last_stat).count() >= 2000) {
                 ALOGI("effect stats: buffers=%llu timeouts=%llu avg_wait=%lluus avg_proc=%lluus "
-                      "state=%d reverb=%d npu=%d upmix_active=%d auto_eq=%d eq_profile=%s",
+                      "state=%d reverb=%d npu=%d upmix_active=%d scene=%d auto_eq=%d eq_profile=%s",
                       (unsigned long long)stat_buffers, (unsigned long long)stat_timeouts,
                       (unsigned long long)(stat_buffers ? stat_wait_us / stat_buffers : 0),
                       (unsigned long long)(stat_buffers ? stat_proc_us / stat_buffers : 0),
                       (int)state_.load(), (int)reverb_.load(), (int)renderer_.npu_active(),
-                      (int)renderer_.upmix_active(), (int)auto_eq_.load(), eq_profile);
+                      (int)renderer_.upmix_active(), (int)scene_adapter_.load(),
+                      (int)auto_eq_.load(), eq_profile);
                 stat_buffers = stat_timeouts = stat_wait_us = stat_proc_us = 0;
                 last_stat = t_end;
             }

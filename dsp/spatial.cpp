@@ -63,11 +63,11 @@ ProfileParams get_profile_params(Profile p) {
             // Same passive side/rear gains as the Ally plugin (spatial.py).
             return {1.2589254f, 0.16f, 0.40f, true, 0.45f, 0.40f};
         case Profile::Music:
-            return {1.0f, 0.08f, 0.25f, false, 0.38f, 0.32f};
+            return {1.0f, 0.13f, 0.30f, false, 0.44f, 0.36f};
         case Profile::Speech:
-            // Podcast / audiobook: no room at all, dialogue lifted, stereo narrowed so
-            // the voice stays centred and the compressor does the loudness work.
-            return {1.32f, 0.0f, 0.0f, true, 0.16f, 0.08f};
+            // Podcast / audiobook: dry by default (reverb_podcast off), subtle studio
+            // room only if the user explicitly enables podcast reverb.
+            return {1.32f, 0.05f, 0.16f, true, 0.16f, 0.08f};
         case Profile::Game:
         default:
             return {1.0f, 0.10f, 0.22f, false, 0.45f, 0.40f};
@@ -526,6 +526,7 @@ void Dynamics::process(float* left, float* right, bool leveler, bool compress) {
 // --- CoherenceUpmix ---
 
 void CoherenceUpmix::init(float sample_rate) {
+    sample_rate_ = sample_rate;
     constexpr double kTwoPi = 2.0 * kPi;
     window_.resize(kN);
     for (int i = 0; i < kN; ++i) {
@@ -584,8 +585,8 @@ void CoherenceUpmix::process(const float* l, const float* r, float* front_l, flo
         out_spec_[3][k] = ambient * L;
         out_spec_[4][k] = ambient * R;
     }
-    float* outs[kOut] = {front_l, front_r, centre, amb_l, amb_r};
-    for (int o = 0; o < kOut; ++o) {
+    float* outs[5] = {front_l, front_r, centre, amb_l, amb_r};
+    for (int o = 0; o < 5; ++o) {
         fft_.inverse(out_spec_[o].data(), frame_.data());
         auto& acc = ola_[o];
         // sqrt-Hann analysis x synthesis = Hann, which sums to 2 at 75% overlap.
@@ -593,6 +594,256 @@ void CoherenceUpmix::process(const float* l, const float* r, float* front_l, flo
         std::memcpy(outs[o], acc.data(), kHop * sizeof(float));
         std::memmove(acc.data(), acc.data() + kHop, (kN - kHop) * sizeof(float));
         std::fill(acc.end() - kHop, acc.end(), 0.0f);
+    }
+}
+
+void CoherenceUpmix::process_scene(const float* l, const float* r, Profile profile,
+                                   float* front_l, float* front_r, float* centre,
+                                   float* side_l, float* side_r, float* amb_l, float* amb_r,
+                                   float* lfe) {
+    const float* in[2] = {l, r};
+    for (int c = 0; c < 2; ++c) {
+        auto& h = history_[c];
+        std::memmove(h.data(), h.data() + kHop, (kN - kHop) * sizeof(float));
+        std::memcpy(h.data() + kN - kHop, in[c], kHop * sizeof(float));
+        for (int i = 0; i < kN; ++i) frame_[i] = h[i] * window_[i];
+        fft_.forward(frame_.data(), spec_[c].data());
+    }
+    const float a = alpha_;
+    const float bin_hz = sample_rate_ / static_cast<float>(kN);
+    const bool is_speech = (profile == Profile::Speech);
+    const bool is_movie = (profile == Profile::Movie);
+    const float max_side_send = is_speech ? 0.08f : (is_movie ? 0.52f : (profile == Profile::Music ? 0.48f : 0.38f));
+
+    for (int k = 0; k < kBins; ++k) {
+        const std::complex<float> L = spec_[0][k], R = spec_[1][k];
+        const float nl = std::norm(L), nr = std::norm(R);
+        pll_[k] = a * pll_[k] + (1.0f - a) * nl;
+        prr_[k] = a * prr_[k] + (1.0f - a) * nr;
+        plr_[k] = a * plr_[k] + (1.0f - a) * (L * std::conj(R));
+
+        const float total = pll_[k] + prr_[k];
+        const float coherence = std::min(1.0f, std::abs(plr_[k]) / std::sqrt(pll_[k] * prr_[k] + 1e-24f));
+        const float pan = (pll_[k] - prr_[k]) / (total + 1e-24f);
+        const float abs_pan = std::abs(pan);
+        const float centred = (1.0f - abs_pan) * (1.0f - abs_pan);
+        const float ambient = (1.0f - coherence) * (1.0f - abs_pan);
+        const float direct = 1.0f - ambient;
+
+        // Per-bin spectral flux detects drum hits and sharp instrument attacks.
+        const float inst = nl + nr;
+        const float flux = std::clamp((inst / (total + 1e-12f) - 1.15f) * 0.45f, 0.0f, 1.0f);
+
+        const float freq = k * bin_hz;
+        // Sub-bass anchor (< 130 Hz) -> LFE + fronts, kept out of surrounds.
+        const float sub_w = std::clamp((130.0f - freq) / 50.0f, 0.0f, 1.0f);
+        // Instrument presence band (220 Hz .. 6.5 kHz): guitars, keys, strings, brass.
+        const float inst_lo = std::clamp((freq - 180.0f) / 140.0f, 0.0f, 1.0f);
+        const float inst_hi = std::clamp((7500.0f - freq) / 2500.0f, 0.0f, 1.0f);
+        const float inst_w = inst_lo * inst_hi;
+        const float air_w = std::clamp((freq - 2800.0f) / 3000.0f, 0.0f, 1.0f);
+
+        const std::complex<float> dl = direct * L;
+        const std::complex<float> dr = direct * R;
+
+        // Center anchor: vocals / dialogue / snare core.
+        float centre_w = centred;
+        if (is_speech) {
+            centre_w = 0.65f + 0.35f * centred;
+        } else if (is_movie && freq >= 200.0f && freq <= 4500.0f) {
+            centre_w = 1.0f - abs_pan;
+        }
+        const std::complex<float> mid = 0.5f * (1.0f - sub_w) * centre_w * (dl + dr);
+        const std::complex<float> fl_base = dl - mid;
+        const std::complex<float> fr_base = dr - mid;
+
+        // Steer wide-panned instruments partially into ±100° side channels (SL/SR)
+        // for genuine out-of-head 7.1 stage width, keeping transients tight.
+        const float send = max_side_send * abs_pan * inst_w * (1.0f - 0.35f * flux);
+        const float keep = std::sqrt(std::max(0.0f, 1.0f - send * send));
+
+        out_spec_[0][k] = fl_base * keep;
+        out_spec_[1][k] = fr_base * keep;
+        out_spec_[2][k] = mid;
+
+        // Uncorrelated ambience + airy upper shimmer -> surrounds & delayed rears.
+        const float amb_scale = is_speech ? 0.12f : (1.0f - 0.75f * sub_w) * (1.0f - 0.40f * flux);
+        const float air_send = is_speech ? 0.0f : (0.16f * air_w * (1.0f - centred));
+        out_spec_[3][k] = (ambient * amb_scale) * L + air_send * fl_base;
+        out_spec_[4][k] = (ambient * amb_scale) * R + air_send * fr_base;
+        out_spec_[5][k] = fl_base * send;
+        out_spec_[6][k] = fr_base * send;
+        out_spec_[7][k] = is_speech ? std::complex<float>{0.0f, 0.0f} : (0.5f * sub_w * (L + R));
+    }
+
+    float* outs[kOut] = {front_l, front_r, centre, amb_l, amb_r, side_l, side_r, lfe};
+    for (int o = 0; o < kOut; ++o) {
+        fft_.inverse(out_spec_[o].data(), frame_.data());
+        auto& acc = ola_[o];
+        for (int i = 0; i < kN; ++i) acc[i] += frame_[i] * window_[i] * 0.5f;
+        std::memcpy(outs[o], acc.data(), kHop * sizeof(float));
+        std::memmove(acc.data(), acc.data() + kHop, (kN - kHop) * sizeof(float));
+        std::fill(acc.end() - kHop, acc.end(), 0.0f);
+    }
+}
+
+// --- SceneProcessor ---
+
+void SceneProcessor::init(float sample_rate) {
+    sample_rate_ = sample_rate;
+    constexpr float kCutoffs[kBands - 1] = {100.0f, 250.0f, 550.0f, 2200.0f, 5500.0f};
+    for (int i = 0; i < kBands - 1; ++i) {
+        xover_[i].configure_lowpass_2nd(kCutoffs[i], sample_rate, 2);
+    }
+    rms_alpha_ = std::exp(-static_cast<float>(kHop) / (sample_rate * 0.80f));
+    gain_slew_ = 1.0f - std::exp(-static_cast<float>(kHop) / (sample_rate * 0.35f));
+    fast_att_ = std::exp(-1.0f / (sample_rate * 0.002f));
+    fast_rel_ = std::exp(-1.0f / (sample_rate * 0.025f));
+    slow_att_ = std::exp(-1.0f / (sample_rate * 0.035f));
+    slow_rel_ = std::exp(-1.0f / (sample_rate * 0.160f));
+    reset();
+}
+
+void SceneProcessor::reset() {
+    for (auto& f : xover_) f.reset();
+    band_power_.fill(1e-4f);
+    band_gain_.fill(1.0f);
+    fast_env_ = 0.0f;
+    slow_env_ = 0.0f;
+}
+
+void SceneProcessor::process(float* left, float* right, Profile profile) {
+    // Split into 6 contiguous bands whose exact sum equals the original signal.
+    std::array<float, kHop> prev_l{}, prev_r{}, lp_l{}, lp_r{};
+    for (int b = 0; b < kBands - 1; ++b) {
+        xover_[b].process(left, lp_l.data(), 0, kHop);
+        xover_[b].process(right, lp_r.data(), 1, kHop);
+        if (b == 0) {
+            b_left_[0] = lp_l;
+            b_right_[0] = lp_r;
+        } else {
+            for (int i = 0; i < kHop; ++i) {
+                b_left_[b][i] = lp_l[i] - prev_l[i];
+                b_right_[b][i] = lp_r[i] - prev_r[i];
+            }
+        }
+        prev_l = lp_l;
+        prev_r = lp_r;
+    }
+    for (int i = 0; i < kHop; ++i) {
+        b_left_[kBands - 1][i] = left[i] - prev_l[i];
+        b_right_[kBands - 1][i] = right[i] - prev_r[i];
+    }
+
+    // Measure live per-band energy and update smoothed spectral profile.
+    float total_energy = 0.0f;
+    std::array<float, kBands> cur_power{};
+    for (int b = 0; b < kBands; ++b) {
+        double sum = 0.0;
+        for (int i = 0; i < kHop; ++i) {
+            sum += static_cast<double>(b_left_[b][i]) * b_left_[b][i] +
+                   static_cast<double>(b_right_[b][i]) * b_right_[b][i];
+        }
+        cur_power[b] = static_cast<float>(sum / (2.0 * kHop));
+        total_energy += cur_power[b];
+    }
+
+    // Target relative spectral balance (dB) + base tonal shaping per profile:
+    // Bands: [sub <100, punch 100-250, mud 250-550, body 550-2200, presence 2.2-5.5k, air >5.5k]
+    std::array<float, kBands> target_rel{};
+    std::array<float, kBands> base_db{};
+    float adapt_strength = 0.40f;
+    float min_db = -3.0f, max_db = 3.2f;
+    float transient_strength = 0.0f;
+    switch (profile) {
+        case Profile::Music:
+            target_rel = {1.5f, 1.0f, -0.8f, 0.6f, 0.4f, -1.5f};
+            base_db    = {0.8f, 0.7f, -0.7f, 0.9f, 1.2f,  0.6f};
+            adapt_strength = 0.38f;
+            min_db = -2.8f; max_db = 3.4f;
+            transient_strength = 0.30f; // Crisp drums & guitar pick attack
+            break;
+        case Profile::Movie:
+            target_rel = {2.0f, 0.5f, -1.0f, 0.8f, 0.5f, -1.8f};
+            base_db    = {1.0f, 0.3f, -1.0f, 0.8f, 1.3f,  0.5f};
+            adapt_strength = 0.35f;
+            min_db = -3.0f; max_db = 3.0f;
+            transient_strength = 0.16f;
+            break;
+        case Profile::Speech:
+            target_rel = {-6.0f, 0.5f, -1.5f, 1.2f, 1.0f, -2.5f};
+            base_db    = {-3.5f, 0.2f, -1.8f, 0.8f, 1.8f, -0.5f};
+            adapt_strength = 0.40f;
+            min_db = -4.5f; max_db = 3.0f;
+            transient_strength = 0.0f;
+            break;
+        case Profile::Game:
+        default:
+            target_rel = {1.2f, 0.6f, -0.8f, 0.6f, 0.6f, -1.4f};
+            base_db    = {0.6f, 0.5f, -0.6f, 0.6f, 1.1f,  0.5f};
+            adapt_strength = 0.32f;
+            min_db = -2.5f; max_db = 3.0f;
+            transient_strength = 0.20f;
+            break;
+    }
+
+    std::array<float, kBands> target_gain{};
+    if (total_energy > 1e-8f) {
+        float mean_db = 0.0f;
+        std::array<float, kBands> band_db{};
+        for (int b = 0; b < kBands; ++b) {
+            band_power_[b] = rms_alpha_ * band_power_[b] + (1.0f - rms_alpha_) * cur_power[b];
+            band_db[b] = 10.0f * std::log10(band_power_[b] + 1e-12f);
+            mean_db += band_db[b];
+        }
+        mean_db /= static_cast<float>(kBands);
+        for (int b = 0; b < kBands; ++b) {
+            const float rel_db = band_db[b] - mean_db;
+            const float corr_db = base_db[b] + (target_rel[b] - rel_db) * adapt_strength;
+            const float clamped_db = std::clamp(corr_db, min_db, max_db);
+            target_gain[b] = std::pow(10.0f, clamped_db / 20.0f);
+        }
+    } else {
+        target_gain.fill(1.0f);
+    }
+
+    // Smooth gain ramp across the hop + selective transient shaping for drums/guitars.
+    std::array<float, kBands> step{};
+    for (int b = 0; b < kBands; ++b) {
+        const float next = band_gain_[b] + (target_gain[b] - band_gain_[b]) * gain_slew_;
+        step[b] = (next - band_gain_[b]) / static_cast<float>(kHop);
+    }
+
+    for (int i = 0; i < kHop; ++i) {
+        float t_boost = 1.0f;
+        if (transient_strength > 0.0f) {
+            // Track attack envelope on punch + body + presence (drums & guitars).
+            const float det_l = b_left_[1][i] + b_left_[3][i] + b_left_[4][i];
+            const float det_r = b_right_[1][i] + b_right_[3][i] + b_right_[4][i];
+            const float amp = 0.5f * (std::abs(det_l) + std::abs(det_r));
+            const float fc = (amp > fast_env_) ? fast_att_ : fast_rel_;
+            const float sc = (amp > slow_env_) ? slow_att_ : slow_rel_;
+            fast_env_ = fc * fast_env_ + (1.0f - fc) * amp;
+            slow_env_ = sc * slow_env_ + (1.0f - sc) * amp;
+            const float ratio = fast_env_ / (slow_env_ + 1e-5f);
+            if (ratio > 1.12f) {
+                t_boost = 1.0f + transient_strength * std::min(1.0f, (ratio - 1.12f) * 0.85f);
+            }
+        }
+
+        float ol = 0.0f, or_ = 0.0f;
+        for (int b = 0; b < kBands; ++b) {
+            float g = band_gain_[b] + step[b] * static_cast<float>(i + 1);
+            if (b == 1 || b == 3 || b == 4) g *= t_boost;
+            ol += b_left_[b][i] * g;
+            or_ += b_right_[b][i] * g;
+        }
+        left[i] = ol;
+        right[i] = or_;
+    }
+
+    for (int b = 0; b < kBands; ++b) {
+        band_gain_[b] += step[b] * static_cast<float>(kHop);
     }
 }
 
@@ -671,6 +922,7 @@ void Renderer::init(float sample_rate) {
     speech_presence_.configure_high_shelf(2800.0f, 4.5f, sample_rate, 2);
     widener_.init(sample_rate);
     upmix_.init(sample_rate);
+    scene_proc_.init(sample_rate);
 #ifdef ALLY_ENABLE_AUTO_EQ
     auto_eq_.init(sample_rate);
 #endif
@@ -691,6 +943,7 @@ void Renderer::reset() {
     cinema_air_.reset();
     widener_.reset();
     upmix_.reset();
+    scene_proc_.reset();
 #ifdef ALLY_ENABLE_AUTO_EQ
     auto_eq_.reset();
 #endif
@@ -727,7 +980,7 @@ void Renderer::set_device(DeviceKind d) {
 }
 
 void Renderer::set_upmix(bool enabled) {
-    if (enabled && !upmix_on_) {
+    if (enabled && !upmix_on_ && !scene_adapter_) {
         upmix_.reset();
 #ifdef ALLY_ENABLE_NPU
         upmix_dialogue_delay_.reset();
@@ -735,6 +988,20 @@ void Renderer::set_upmix(bool enabled) {
 #endif
     }
     upmix_on_ = enabled;
+}
+
+void Renderer::set_scene_adapter(bool enabled) {
+    if (enabled != scene_adapter_) {
+        scene_proc_.reset();
+        if (enabled && !upmix_on_) {
+            upmix_.reset();
+#ifdef ALLY_ENABLE_NPU
+            upmix_dialogue_delay_.reset();
+            upmix_uses_neural_ = false;
+#endif
+        }
+    }
+    scene_adapter_ = enabled;
 }
 
 bool Renderer::detect_surround() {
@@ -792,7 +1059,7 @@ void Renderer::make_stereo_feeds(bool& has_lfe) {
         vocals_.process(&block_[0], dry.data(), sep_rest.data(), tick_);
 
         has_lfe = true;
-        if (upmix_on_) {
+        if (upmix_on_ || scene_adapter_) {
             for (int i = 0; i < kHop; ++i) {
                 const float vl = (dry[i] - sep_rest[i]) * kVoiceToCentre;
                 const float vr = (dry[kHop + i] - sep_rest[kHop + i]) * kVoiceToCentre;
@@ -833,6 +1100,56 @@ void Renderer::make_stereo_feeds(bool& has_lfe) {
         }
     }
 #endif
+
+    if (scene_adapter_) {
+#ifdef ALLY_ENABLE_NPU
+        if (has_lfe != upmix_uses_neural_) {
+            upmix_.reset();
+            upmix_dialogue_delay_.reset();
+            upmix_uses_neural_ = has_lfe;
+        }
+#endif
+        std::array<float, kHop> centre{}, side_l{}, side_r{}, scene_lfe{};
+        upmix_.process_scene(fl, fr, profile_, &feeds_[0 * kHop], &feeds_[1 * kHop],
+                             centre.data(), side_l.data(), side_r.data(),
+                             &amb[0 * kHop], &amb[1 * kHop], scene_lfe.data());
+        for (int i = 0; i < kHop; ++i) {
+            feeds_[0 * kHop + i] *= kUpmixMakeup;
+            feeds_[1 * kHop + i] *= kUpmixMakeup;
+            feeds_[2 * kHop + i] = centre[i] * kUpmixMakeup * cfg.dialogue;
+            amb[0 * kHop + i] *= kUpmixMakeup;
+            amb[1 * kHop + i] *= kUpmixMakeup;
+        }
+        const float scene_side_gain = (profile_ == Profile::Speech) ? 0.14f
+                                    : (profile_ == Profile::Movie ? 0.56f : 0.54f);
+        const float scene_rear_gain = (profile_ == Profile::Speech) ? 0.08f
+                                    : (profile_ == Profile::Movie ? 0.50f : 0.46f);
+        ambience_delay_.process(amb.data(), rear.data(), kHop);
+        for (int i = 0; i < kHop; ++i) {
+            feeds_[3 * kHop + i] = rear[0 * kHop + i] * scene_rear_gain;
+            feeds_[4 * kHop + i] = rear[1 * kHop + i] * scene_rear_gain;
+            feeds_[5 * kHop + i] = amb[0 * kHop + i] * scene_side_gain + side_l[i] * kUpmixMakeup;
+            feeds_[6 * kHop + i] = amb[1 * kHop + i] * scene_side_gain + side_r[i] * kUpmixMakeup;
+        }
+#ifdef ALLY_ENABLE_NPU
+        if (has_lfe) {
+            upmix_dialogue_delay_.process(dialogue_lfe.data(), dialogue_lfe.data(), kHop);
+            for (int i = 0; i < kHop; ++i) {
+                feeds_[2 * kHop + i] += dialogue_lfe[i] * cfg.dialogue;
+                lfe_[i] = dialogue_lfe[kHop + i] + scene_lfe[i] * 0.22f;
+            }
+            return;
+        }
+#endif
+        if (profile_ != Profile::Speech) {
+            const float lfe_scale = (profile_ == Profile::Movie) ? 0.28f : 0.22f;
+            for (int i = 0; i < kHop; ++i) {
+                lfe_[i] = scene_lfe[i] * lfe_scale;
+            }
+            has_lfe = true;
+        }
+        return;
+    }
 
     if (upmix_on_) {
 #ifdef ALLY_ENABLE_NPU
@@ -1056,6 +1373,9 @@ void Renderer::process_hop() {
         for (int i = 0; i < kHop; ++i) {
             out_l[i] *= trim;
             out_r[i] *= trim;
+        }
+        if (scene_adapter_) {
+            scene_proc_.process(out_l, out_r, profile_);
         }
 #ifdef ALLY_ENABLE_AUTO_EQ
         auto_eq_.apply(out_l, out_r);

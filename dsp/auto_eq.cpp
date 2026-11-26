@@ -66,8 +66,8 @@ constexpr const char* kNames[] = {
     "neutral", "speech", "music", "metal", "rock", "jazz", "classical", "electronic", "hiphop", "error"
 };
 constexpr float kCurves[][3] = {
-    {0, 0, 0}, {-1.8f, 2, 0}, {0, 0, 0}, {0.5f, 0.2f, -1}, {0.5f, 0.8f, -0.2f},
-    {0, -0.4f, 0.8f}, {0, 0, 0.5f}, {1, -0.4f, 0.3f}, {1.2f, 0.4f, 0}, {0, 0, 0}
+    {0, 0, 0}, {-1.8f, 2, 0}, {0.3f, 0.4f, 0.3f}, {0.5f, 0.4f, -0.8f}, {0.6f, 0.9f, 0.0f},
+    {0, 0.2f, 0.8f}, {0, 0.2f, 0.5f}, {1.0f, 0.0f, 0.4f}, {1.2f, 0.4f, 0.2f}, {0, 0, 0}
 };
 
 class Models {
@@ -407,10 +407,10 @@ struct AutoEq::Impl {
     explicit Impl(float sample_rate)
         : rate(sample_rate), capture(std::ceil(kPatch * rate / kRate)), job(capture.size()),
           slew(1 - std::exp(-kHop / (rate * 0.65f))) {
-        low.configure_lowpass_2nd(180, rate, 2);
-        mid_hp.configure_highpass_2nd(1000, rate, 2);
-        mid_lp.configure_lowpass_2nd(4200, rate, 2);
-        high.configure_highpass_2nd(5200, rate, 2);
+        low.configure_lowpass_2nd(200, rate, 2);
+        mid_hp.configure_highpass_2nd(450, rate, 2);
+        mid_lp.configure_lowpass_2nd(4500, rate, 2);
+        high.configure_highpass_2nd(5500, rate, 2);
         for (size_t p = 0; p < targets.size(); ++p) {
             for (size_t band = 0; band < gains.size(); ++band) {
                 targets[p][band] = std::pow(10.0f, kCurves[p][band] / 20) - 1;

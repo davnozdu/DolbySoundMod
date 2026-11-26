@@ -10,6 +10,8 @@ fi
 [ -f "$DATA_DIR/apps.conf" ] || touch "$DATA_DIR/apps.conf"
 [ -f "$DATA_DIR/device.conf" ] || echo "auto" > "$DATA_DIR/device.conf"
 [ -f "$DATA_DIR/neural.conf" ] || echo "0" > "$DATA_DIR/neural.conf"
+[ -f "$DATA_DIR/reverb_music.conf" ] || echo "1" > "$DATA_DIR/reverb_music.conf"
+[ -f "$DATA_DIR/scene_music.conf" ] || echo "1" > "$DATA_DIR/scene_music.conf"
 [ -f "$DATA_DIR/auto_update.conf" ] || echo "1" > "$DATA_DIR/auto_update.conf"
 
 # Wait for Android boot to complete

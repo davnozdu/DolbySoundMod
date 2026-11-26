@@ -28,6 +28,79 @@
     </section>
 
     <section class="card">
+      <div class="card-title">Адаптер сцены (7.1 и баланс в реальном времени)</div>
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-title">Музыка</div>
+          <div class="toggle-sub">Сканирует микс в реальном времени, раскладывает инструменты в 7.1, выделяет гитары и атаку барабанов.</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="toggle-scene-music" />
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="divider"></div>
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-title">Фильмы</div>
+          <div class="toggle-sub">Объёмная 7.1-сцена для эффектов и оркестра, чёткий центр для диалогов и LFE-фундамент.</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="toggle-scene-movie" />
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="divider"></div>
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-title">Подкасты</div>
+          <div class="toggle-sub">Фокус голоса в центре, студийная разборчивость речи и подавление гула.</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="toggle-scene-podcast" />
+          <span class="slider"></span>
+        </label>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-title">Реверберация (объём помещения)</div>
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-title">Музыка</div>
+          <div class="toggle-sub">Акустический объём и воздух вокруг инструментов в наушниках.</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="toggle-reverb-music" />
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="divider"></div>
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-title">Фильмы</div>
+          <div class="toggle-sub">Объём кинозала для фильмов и сериалов.</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="toggle-reverb-movie" />
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="divider"></div>
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-title">Подкасты</div>
+          <div class="toggle-sub">Лёгкий камерный объём студии (по умолчанию выключено для сухой речи).</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="toggle-reverb-podcast" />
+          <span class="slider"></span>
+        </label>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-title">Общие модули</div>
       <div class="toggle-row">
         <div>
           <div class="toggle-title">Нейросеть</div>
@@ -41,19 +114,8 @@
       <div class="divider"></div>
       <div class="toggle-row">
         <div>
-          <div class="toggle-title">Реверберация (кинозал)</div>
-          <div class="toggle-sub">Зал/эхо для профиля «Фильм». Выключено — звук сухой и без эха.</div>
-        </div>
-        <label class="switch">
-          <input type="checkbox" id="toggle-reverb" />
-          <span class="slider"></span>
-        </label>
-      </div>
-      <div class="divider"></div>
-      <div class="toggle-row">
-        <div>
           <div class="toggle-title">Точный апмикс 7.1</div>
-          <div class="toggle-sub">Распределяет стереозвук по виртуальным каналам. В профиле «Фильм» с нейросетью диалог остаётся в центре.</div>
+          <div class="toggle-sub">Базовый когерентный апмикс 2.0 → 7.1 (если выключен «Адаптер сцены»).</div>
         </div>
         <label class="switch">
           <input type="checkbox" id="toggle-upmix" />

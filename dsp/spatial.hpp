@@ -147,10 +147,16 @@ public:
     // l, r: one hop of input; outputs one hop each (delayed by kN - kHop samples).
     void process(const float* l, const float* r, float* front_l, float* front_r,
                  float* centre, float* amb_l, float* amb_r);
+    // Real-time 2.0 -> 7.1 instrument & scene placement (adds dedicated side & LFE feeds).
+    void process_scene(const float* l, const float* r, Profile profile,
+                       float* front_l, float* front_r, float* centre,
+                       float* side_l, float* side_r, float* amb_l, float* amb_r,
+                       float* lfe);
 
 private:
-    static constexpr int kOut = 5;  // front L/R, centre, ambient L/R
+    static constexpr int kOut = 8;  // front L/R, centre, ambient L/R, side L/R, lfe
     RealFFT fft_{kN};
+    float sample_rate_ = 48000.0f;
     float alpha_ = 0.9f;
     std::vector<float> window_;                         // sqrt periodic Hann
     std::array<std::vector<float>, 2> history_;         // kN per channel
@@ -160,6 +166,38 @@ private:
     std::vector<float> frame_;
     std::vector<float> pll_, prr_;
     std::vector<std::complex<float>> plr_;
+};
+
+// Real-time 6-band adaptive scene EQ + transient shaper.
+// Scans live spectral balance across 6 musical bands and smoothly balances any mix
+// (guitars, drums, vocals, acoustic/electronic instruments), while enhancing rhythmic
+// attack transients for crisp drums and plucked strings.
+class SceneProcessor {
+public:
+    static constexpr int kBands = 6;
+
+    void init(float sample_rate);
+    void reset();
+    void process(float* left, float* right, Profile profile);
+
+private:
+    float sample_rate_ = 48000.0f;
+    float rms_alpha_ = 0.99f;
+    float gain_slew_ = 0.01f;
+    float fast_att_ = 0.0f;
+    float fast_rel_ = 0.0f;
+    float slow_att_ = 0.0f;
+    float slow_rel_ = 0.0f;
+    float fast_env_ = 0.0f;
+    float slow_env_ = 0.0f;
+
+    // 5 crossover lowpass filters split the signal into 6 contiguous bands:
+    // [0..100], [100..250], [250..550], [550..2200], [2200..5500], [5500..Nyquist]
+    std::array<BiquadFilter, kBands - 1> xover_;
+    std::array<float, kBands> band_power_{};
+    std::array<float, kBands> band_gain_{};
+    std::array<std::array<float, kHop>, kBands> b_left_{};
+    std::array<std::array<float, kHop>, kBands> b_right_{};
 };
 
 class CrosstalkWidener {
@@ -188,8 +226,10 @@ public:
     void set_upmix(bool enabled);
     bool upmix() const { return upmix_on_; }
     bool upmix_active() const {
-        return upmix_on_ && !is_surround_ && !bypass_ && profile_ != Profile::Off;
+        return (upmix_on_ || scene_adapter_) && !is_surround_ && !bypass_ && profile_ != Profile::Off;
     }
+    void set_scene_adapter(bool enabled);
+    bool scene_adapter() const { return scene_adapter_; }
 
     Profile profile() const { return profile_; }
     DeviceKind device() const { return device_; }
@@ -232,6 +272,7 @@ private:
     bool reverb_ = true;
     bool bypass_ = false;
     bool upmix_on_ = false;
+    bool scene_adapter_ = false;
     bool neural_ = false;
     uint64_t tick_ = 0;
 
@@ -258,6 +299,7 @@ private:
     BiquadFilter glasses_bass_;
     CrosstalkWidener widener_;
     CoherenceUpmix upmix_;
+    SceneProcessor scene_proc_;
     Dynamics dynamics_;
 
     double clock_ = 0.0;

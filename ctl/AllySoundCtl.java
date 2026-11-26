@@ -25,6 +25,12 @@ public class AllySoundCtl {
     private static final String DEVICE_CONF = BASE_DIR + "/device.conf";
     private static final String NEURAL_CONF = BASE_DIR + "/neural.conf";
     private static final String REVERB_CONF = BASE_DIR + "/reverb.conf";
+    private static final String REVERB_MUSIC_CONF = BASE_DIR + "/reverb_music.conf";
+    private static final String REVERB_MOVIE_CONF = BASE_DIR + "/reverb_movie.conf";
+    private static final String REVERB_PODCAST_CONF = BASE_DIR + "/reverb_podcast.conf";
+    private static final String SCENE_MUSIC_CONF = BASE_DIR + "/scene_music.conf";
+    private static final String SCENE_MOVIE_CONF = BASE_DIR + "/scene_movie.conf";
+    private static final String SCENE_PODCAST_CONF = BASE_DIR + "/scene_podcast.conf";
     private static final String UPMIX_CONF = BASE_DIR + "/upmix.conf";
     private static final String AUTO_EQ_CONF = BASE_DIR + "/auto_eq.conf";
     private static final String STATUS_JSON = BASE_DIR + "/status.json";
@@ -37,6 +43,7 @@ public class AllySoundCtl {
         int reverb;
         int upmix;
         int autoEq;
+        int sceneAdapter;
         int device;
     }
 
@@ -129,13 +136,17 @@ public class AllySoundCtl {
     }
 
     private static int readToggle(String path) {
+        return readToggleDefault(path, 0);
+    }
+
+    private static int readToggleDefault(String path, int def) {
         File f = new File(path);
-        if (!f.exists()) return 0;
+        if (!f.exists()) return def;
         try (BufferedReader br = new BufferedReader(new FileReader(f))) {
             String line = br.readLine();
             return (line != null && "1".equals(line.trim())) ? 1 : 0;
         } catch (Exception e) {
-            return 0;
+            return def;
         }
     }
 
@@ -373,10 +384,11 @@ public class AllySoundCtl {
     }
 
     private static void setAllyParam(AudioEffect fx, int profile, int neural, int reverb,
-                                     int upmix, int autoEq, int device) throws Exception {
+                                     int upmix, int autoEq, int sceneAdapter, int device) throws Exception {
         Method setParam = AudioEffect.class.getDeclaredMethod("setParameter", int.class, int.class);
         setParam.setAccessible(true);
-        int code = 50000 + (2 * autoEq + upmix) * 10000 + profile * 1000 + neural * 100 + reverb * 10 + device;
+        int flags = sceneAdapter * 4 + autoEq * 2 + upmix;
+        int code = 50000 + flags * 10000 + profile * 1000 + neural * 100 + reverb * 10 + device;
         setParam.invoke(fx, 0 /* PARAM_TARGET_GAIN_MB */, code);
     }
 
@@ -398,6 +410,7 @@ public class AllySoundCtl {
               .append(",\"reverb\":").append(se.reverb != 0)
               .append(",\"upmix\":").append(se.upmix != 0)
               .append(",\"auto_eq\":").append(se.autoEq != 0)
+              .append(",\"scene_adapter\":").append(se.sceneAdapter != 0)
               .append(",\"neural\":").append(se.neural != 0).append("}");
         }
         sb.append("]}");
@@ -426,7 +439,9 @@ public class AllySoundCtl {
         // (`dumpsys audio`) and the status file are refreshed every 1.5 s.
         long tick = 0;
         Map<String, Integer> apps = null;
-        int device = 0, neural = 0, reverb = 0, upmix = 0, autoEq = 0;
+        int device = 0, neural = 0, upmix = 0, autoEq = 0;
+        int reverbMusic = 1, reverbMovie = 0, reverbPodcast = 0;
+        int sceneMusic = 1, sceneMovie = 0, scenePodcast = 0;
         while (true) {
             try {
                 final boolean refresh = tick++ % 6 == 0 || apps == null;
@@ -434,7 +449,13 @@ public class AllySoundCtl {
                     apps = readAppsConf();
                     device = detectOutputDevice(readDeviceMode());
                     neural = readNeuralEnabled();
-                    reverb = readReverbEnabled();
+                    int legacyReverb = readReverbEnabled();
+                    reverbMusic = readToggleDefault(REVERB_MUSIC_CONF, 1);
+                    reverbMovie = readToggleDefault(REVERB_MOVIE_CONF, legacyReverb);
+                    reverbPodcast = readToggleDefault(REVERB_PODCAST_CONF, 0);
+                    sceneMusic = readToggleDefault(SCENE_MUSIC_CONF, 1);
+                    sceneMovie = readToggleDefault(SCENE_MOVIE_CONF, 0);
+                    scenePodcast = readToggleDefault(SCENE_PODCAST_CONF, 0);
                     upmix = readToggle(UPMIX_CONF);
                     autoEq = readToggle(AUTO_EQ_CONF);
                 }
@@ -494,6 +515,11 @@ public class AllySoundCtl {
                     Integer prof = apps.get(pkg);
                     if (prof == null || prof == 0) continue;
 
+                    int sessReverb = (prof == 3) ? reverbMusic
+                                   : (prof == 4 ? reverbPodcast : reverbMovie);
+                    int sessScene = (prof == 3) ? sceneMusic
+                                  : (prof == 2 ? sceneMovie : (prof == 4 ? scenePodcast : 0));
+
                     SessionEffect se = active.get(sid);
                     if (se == null) {
                         // Do not hammer AudioFlinger: one attempt per 15 s per session
@@ -502,16 +528,17 @@ public class AllySoundCtl {
                         if (failed != null && System.currentTimeMillis() - failed < 15000) continue;
                         try {
                             AudioEffect fx = createAllyEffect(sid);
-                            setAllyParam(fx, prof, neural, reverb, upmix, autoEq, device);
+                            setAllyParam(fx, prof, neural, sessReverb, upmix, autoEq, sessScene, device);
                             fx.setEnabled(true);
                             se = new SessionEffect();
                             se.effect = fx;
                             se.pkg = pkg;
                             se.profile = prof;
                             se.neural = neural;
-                            se.reverb = reverb;
+                            se.reverb = sessReverb;
                             se.upmix = upmix;
                             se.autoEq = autoEq;
+                            se.sceneAdapter = sessScene;
                             se.device = device;
                             active.put(sid, se);
                             failedAt.remove(sid);
@@ -520,15 +547,17 @@ public class AllySoundCtl {
                             failedAt.put(sid, System.currentTimeMillis());
                             lastError = e.getClass().getSimpleName() + ": " + e.getMessage();
                         }
-                    } else if (se.profile != prof || se.neural != neural || se.reverb != reverb ||
-                               se.upmix != upmix || se.autoEq != autoEq || se.device != device) {
+                    } else if (se.profile != prof || se.neural != neural || se.reverb != sessReverb ||
+                               se.upmix != upmix || se.autoEq != autoEq || se.sceneAdapter != sessScene ||
+                               se.device != device) {
                         try {
-                            setAllyParam(se.effect, prof, neural, reverb, upmix, autoEq, device);
+                            setAllyParam(se.effect, prof, neural, sessReverb, upmix, autoEq, sessScene, device);
                             se.profile = prof;
                             se.neural = neural;
-                            se.reverb = reverb;
+                            se.reverb = sessReverb;
                             se.upmix = upmix;
                             se.autoEq = autoEq;
+                            se.sceneAdapter = sessScene;
                             se.device = device;
                             lastError = null;
                         } catch (Exception e) {

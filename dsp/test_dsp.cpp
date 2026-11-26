@@ -19,6 +19,8 @@ int main() {
         in[2 * i + 1] = 0.25f * std::sin(2.0f * 3.14159265f * 550.0f * t);
     }
 
+    for (bool scene : {false, true}) {
+    r.set_scene_adapter(scene);
     for (bool upmix : {false, true}) {
     r.set_upmix(upmix);
     for (auto prof : {ally::Profile::Game, ally::Profile::Movie, ally::Profile::Music,
@@ -36,6 +38,36 @@ int main() {
             assert(energy > 0.1);
         }
     }
+    }
+    }
+
+    // Scene adapter: verify 2.0 -> 7.1 music placement produces side & LFE feeds and alters render.
+    {
+        ally::CoherenceUpmix u;
+        u.init(48000.0f);
+        constexpr int H = ally::kHop, kHops = 80;
+        float fl[H], fr[H], c[H], sl[H], sr[H], al[H], ar[H], lfe[H];
+        double side_e = 0.0, lfe_e = 0.0;
+        for (int h = 0; h < kHops; ++h) {
+            float L[H], R[H];
+            for (int i = 0; i < H; ++i) {
+                const float t = static_cast<float>(h * H + i) / 48000.0f;
+                const float kick = 0.25f * std::sin(2.0f * 3.14159265f * 65.0f * t);
+                const float guitar_l = 0.25f * std::sin(2.0f * 3.14159265f * 1200.0f * t);
+                const float guitar_r = 0.25f * std::sin(2.0f * 3.14159265f * 1800.0f * t);
+                L[i] = kick + guitar_l;
+                R[i] = kick + guitar_r;
+            }
+            u.process_scene(L, R, ally::Profile::Music, fl, fr, c, sl, sr, al, ar, lfe);
+            if (h > 8) {
+                for (int i = 0; i < H; ++i) {
+                    side_e += sl[i] * sl[i] + sr[i] * sr[i];
+                    lfe_e += lfe[i] * lfe[i];
+                }
+            }
+        }
+        assert(side_e > 1.0);
+        assert(lfe_e > 1.0);
     }
 
     // Coherence upmix: front + centre + ambient must rebuild the input exactly.

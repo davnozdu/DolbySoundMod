@@ -3,6 +3,12 @@ const APPS_CONF = `${DATA_DIR}/apps.conf`;
 const DEVICE_CONF = `${DATA_DIR}/device.conf`;
 const NEURAL_CONF = `${DATA_DIR}/neural.conf`;
 const REVERB_CONF = `${DATA_DIR}/reverb.conf`;
+const REVERB_MUSIC_CONF = `${DATA_DIR}/reverb_music.conf`;
+const REVERB_MOVIE_CONF = `${DATA_DIR}/reverb_movie.conf`;
+const REVERB_PODCAST_CONF = `${DATA_DIR}/reverb_podcast.conf`;
+const SCENE_MUSIC_CONF = `${DATA_DIR}/scene_music.conf`;
+const SCENE_MOVIE_CONF = `${DATA_DIR}/scene_movie.conf`;
+const SCENE_PODCAST_CONF = `${DATA_DIR}/scene_podcast.conf`;
 const UPMIX_CONF = `${DATA_DIR}/upmix.conf`;
 const AUTO_EQ_CONF = `${DATA_DIR}/auto_eq.conf`;
 const AUTO_UPDATE_CONF = `${DATA_DIR}/auto_update.conf`;
@@ -81,8 +87,19 @@ async function loadConfig() {
     deviceMode = ['auto', 'headphones', 'speakers', 'glasses'].includes(devRaw) ? devRaw : 'auto';
     const neuralRaw = (await execCmd(`cat "${NEURAL_CONF}" 2>/dev/null || echo 0`)).trim();
     document.getElementById('toggle-neural').checked = (neuralRaw === '1');
-    const reverbRaw = (await execCmd(`cat "${REVERB_CONF}" 2>/dev/null || echo 0`)).trim();
-    document.getElementById('toggle-reverb').checked = (reverbRaw === '1');
+    const legacyRev = (await execCmd(`cat "${REVERB_CONF}" 2>/dev/null || echo 0`)).trim();
+    const revMusic = (await execCmd(`cat "${REVERB_MUSIC_CONF}" 2>/dev/null || echo 1`)).trim();
+    document.getElementById('toggle-reverb-music').checked = (revMusic === '1');
+    const revMovie = (await execCmd(`cat "${REVERB_MOVIE_CONF}" 2>/dev/null || echo "${legacyRev}"`)).trim();
+    document.getElementById('toggle-reverb-movie').checked = (revMovie === '1');
+    const revPodcast = (await execCmd(`cat "${REVERB_PODCAST_CONF}" 2>/dev/null || echo 0`)).trim();
+    document.getElementById('toggle-reverb-podcast').checked = (revPodcast === '1');
+    const sceneMusic = (await execCmd(`cat "${SCENE_MUSIC_CONF}" 2>/dev/null || echo 1`)).trim();
+    document.getElementById('toggle-scene-music').checked = (sceneMusic === '1');
+    const sceneMovie = (await execCmd(`cat "${SCENE_MOVIE_CONF}" 2>/dev/null || echo 0`)).trim();
+    document.getElementById('toggle-scene-movie').checked = (sceneMovie === '1');
+    const scenePodcast = (await execCmd(`cat "${SCENE_PODCAST_CONF}" 2>/dev/null || echo 0`)).trim();
+    document.getElementById('toggle-scene-podcast').checked = (scenePodcast === '1');
     const upmixRaw = (await execCmd(`cat "${UPMIX_CONF}" 2>/dev/null || echo 0`)).trim();
     document.getElementById('toggle-upmix').checked = (upmixRaw === '1');
     const eqRaw = (await execCmd(`cat "${AUTO_EQ_CONF}" 2>/dev/null || echo 0`)).trim();
@@ -286,30 +303,25 @@ document.getElementById('app-modal').onkeydown = (e) => {
   }
 };
 
-document.getElementById('toggle-neural').onchange = async (e) => {
-  const v = e.target.checked ? '1' : '0';
-  await execCmd(`mkdir -p "${DATA_DIR}" && echo "${v}" > "${NEURAL_CONF}"`);
-};
+function bindToggle(id, confPath) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.onchange = async (e) => {
+    const v = e.target.checked ? '1' : '0';
+    await execCmd(`mkdir -p "${DATA_DIR}" && echo "${v}" > "${confPath}"`);
+  };
+}
 
-document.getElementById('toggle-reverb').onchange = async (e) => {
-  const v = e.target.checked ? '1' : '0';
-  await execCmd(`mkdir -p "${DATA_DIR}" && echo "${v}" > "${REVERB_CONF}"`);
-};
-
-document.getElementById('toggle-upmix').onchange = async (e) => {
-  const v = e.target.checked ? '1' : '0';
-  await execCmd(`mkdir -p "${DATA_DIR}" && echo "${v}" > "${UPMIX_CONF}"`);
-};
-
-document.getElementById('toggle-auto-eq').onchange = async (e) => {
-  const v = e.target.checked ? '1' : '0';
-  await execCmd(`mkdir -p "${DATA_DIR}" && echo "${v}" > "${AUTO_EQ_CONF}"`);
-};
-
-document.getElementById('toggle-autoupdate').onchange = async (e) => {
-  const v = e.target.checked ? '1' : '0';
-  await execCmd(`mkdir -p "${DATA_DIR}" && echo "${v}" > "${AUTO_UPDATE_CONF}"`);
-};
+bindToggle('toggle-neural', NEURAL_CONF);
+bindToggle('toggle-reverb-music', REVERB_MUSIC_CONF);
+bindToggle('toggle-reverb-movie', REVERB_MOVIE_CONF);
+bindToggle('toggle-reverb-podcast', REVERB_PODCAST_CONF);
+bindToggle('toggle-scene-music', SCENE_MUSIC_CONF);
+bindToggle('toggle-scene-movie', SCENE_MOVIE_CONF);
+bindToggle('toggle-scene-podcast', SCENE_PODCAST_CONF);
+bindToggle('toggle-upmix', UPMIX_CONF);
+bindToggle('toggle-auto-eq', AUTO_EQ_CONF);
+bindToggle('toggle-autoupdate', AUTO_UPDATE_CONF);
 
 document.getElementById('btn-check-update').onclick = async () => {
   const sub = document.getElementById('update-sub');
