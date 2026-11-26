@@ -147,14 +147,13 @@ public:
     // l, r: one hop of input; outputs one hop each (delayed by kN - kHop samples).
     void process(const float* l, const float* r, float* front_l, float* front_r,
                  float* centre, float* amb_l, float* amb_r);
-    // Real-time 2.0 -> 7.1 instrument & scene placement (adds dedicated side & LFE feeds).
+    // Real-time 2.0 -> 7.1 instrument & scene placement (returns 5 STFT stems; LFE is time-domain).
     void process_scene(const float* l, const float* r, Profile profile,
                        float* front_l, float* front_r, float* centre,
-                       float* side_l, float* side_r, float* amb_l, float* amb_r,
-                       float* lfe);
+                       float* side_l, float* side_r, float* rear_l, float* rear_r);
 
 private:
-    static constexpr int kOut = 8;  // front L/R, centre, ambient L/R, side L/R, lfe
+    static constexpr int kOut = 7;  // front L/R, centre, side L/R, rear L/R
     RealFFT fft_{kN};
     float sample_rate_ = 48000.0f;
     float alpha_ = 0.9f;
@@ -168,10 +167,9 @@ private:
     std::vector<std::complex<float>> plr_;
 };
 
-// Real-time 6-band adaptive scene EQ + transient shaper.
-// Scans live spectral balance across 6 musical bands and smoothly balances any mix
-// (guitars, drums, vocals, acoustic/electronic instruments), while enhancing rhythmic
-// attack transients for crisp drums and plucked strings.
+// Real-time 6-band adaptive scene EQ + dual-band transient shaper + M/S clarity exciter.
+// Scans live spectral balance across 6 musical bands, clears low-mid mud, separates
+// side-panned guitars from centered drums/bass/vocals, and sharpens drum & string attacks.
 class SceneProcessor {
 public:
     static constexpr int kBands = 6;
@@ -188,8 +186,11 @@ private:
     float fast_rel_ = 0.0f;
     float slow_att_ = 0.0f;
     float slow_rel_ = 0.0f;
-    float fast_env_ = 0.0f;
-    float slow_env_ = 0.0f;
+    // Dual-band transient envelopes: low (kick/bass punch) and high (snare/guitar/cymbal snap)
+    float low_fast_ = 0.0f;
+    float low_slow_ = 0.0f;
+    float hi_fast_ = 0.0f;
+    float hi_slow_ = 0.0f;
 
     // 5 crossover lowpass filters split the signal into 6 contiguous bands:
     // [0..100], [100..250], [250..550], [550..2200], [2200..5500], [5500..Nyquist]

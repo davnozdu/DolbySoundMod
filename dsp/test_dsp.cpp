@@ -41,13 +41,13 @@ int main() {
     }
     }
 
-    // Scene adapter: verify 2.0 -> 7.1 music placement produces side & LFE feeds and alters render.
+    // Scene adapter: verify 2.0 -> 7.1 music placement produces side & rear feeds.
     {
         ally::CoherenceUpmix u;
         u.init(48000.0f);
         constexpr int H = ally::kHop, kHops = 80;
-        float fl[H], fr[H], c[H], sl[H], sr[H], al[H], ar[H], lfe[H];
-        double side_e = 0.0, lfe_e = 0.0;
+        float fl[H], fr[H], c[H], sl[H], sr[H], rl[H], rr[H];
+        double side_e = 0.0;
         for (int h = 0; h < kHops; ++h) {
             float L[H], R[H];
             for (int i = 0; i < H; ++i) {
@@ -58,16 +58,14 @@ int main() {
                 L[i] = kick + guitar_l;
                 R[i] = kick + guitar_r;
             }
-            u.process_scene(L, R, ally::Profile::Music, fl, fr, c, sl, sr, al, ar, lfe);
+            u.process_scene(L, R, ally::Profile::Music, fl, fr, c, sl, sr, rl, rr);
             if (h > 8) {
                 for (int i = 0; i < H; ++i) {
                     side_e += sl[i] * sl[i] + sr[i] * sr[i];
-                    lfe_e += lfe[i] * lfe[i];
                 }
             }
         }
         assert(side_e > 1.0);
-        assert(lfe_e > 1.0);
     }
 
     // Coherence upmix: front + centre + ambient must rebuild the input exactly.

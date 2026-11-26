@@ -170,6 +170,9 @@ public:
         frame_count_ = static_cast<size_t>(std::max<int64_t>(common.input.frameCount, 256));
 
         renderer_.init(sample_rate_);
+        // KU100 HRIR is 48 kHz; bypass heavy convolution on Hi-Res (>48 kHz) DIRECT
+        // streams (e.g. Apple Music 96 kHz) so they never stall or mute.
+        renderer_.set_bypass(sample_rate_ > 50000.0f);
         renderer_.set_profile(profile_.load());
         renderer_.set_device(device_.load());
         renderer_.set_neural(neural_.load());
