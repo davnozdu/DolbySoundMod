@@ -331,6 +331,7 @@ void Convolver::init(int sources, int ears, int length, const float* responses, 
     ears_ = ears;
     diagonal_ = diagonal;
     parts_ = (length + kHop - 1) / kHop;
+    history_head_ = 0;
     const size_t bins = fft_.bins();
     spectra_.assign(parts_ * sources_ * ears_ * bins, {0.0f, 0.0f});
     history_.assign(parts_ * sources_ * bins, {0.0f, 0.0f});
@@ -361,37 +362,42 @@ void Convolver::set_responses(int length, const float* responses) {
 }
 
 void Convolver::reset() {
+    history_head_ = 0;
     std::fill(history_.begin(), history_.end(), std::complex<float>{0.0f, 0.0f});
     std::fill(previous_.begin(), previous_.end(), 0.0f);
 }
 
 void Convolver::process(const float* in, float* out) {
     const size_t bins = fft_.bins();
-    // Shift history
-    if (parts_ > 1) {
-        const size_t slice = sources_ * bins;
-        std::memmove(history_.data() + slice, history_.data(), (parts_ - 1) * slice * sizeof(std::complex<float>));
-    }
+    // Write the newest FFT into the ring and read older partitions in delay order.
+    if (--history_head_ < 0) history_head_ = parts_ - 1;
+    const auto history_slot = [&](int part) {
+        const int index = history_head_ + part;
+        return history_.data() + (index < parts_ ? index : index - parts_) * sources_ * bins;
+    };
+    auto* newest = history_slot(0);
     for (int s = 0; s < sources_; ++s) {
         std::memcpy(frame_buf_.data(), &previous_[s * kHop], kHop * sizeof(float));
         std::memcpy(frame_buf_.data() + kHop, &in[s * kHop], kHop * sizeof(float));
         std::memcpy(&previous_[s * kHop], &in[s * kHop], kHop * sizeof(float));
-        fft_.forward(frame_buf_.data(), &history_[s * bins]);
+        fft_.forward(frame_buf_.data(), newest + s * bins);
     }
 
     std::fill(accum_.begin(), accum_.end(), std::complex<float>{0.0f, 0.0f});
     if (diagonal_) {
         for (int p = 0; p < parts_; ++p) {
+            const auto* history = history_slot(p);
             for (int s = 0; s < sources_; ++s) {
-                const auto* h = &history_[(p * sources_ + s) * bins];
+                const auto* h = history + s * bins;
                 const auto* sp = &spectra_[((p * sources_ + s) * ears_ + 0) * bins];
                 complex_mac(&accum_[s * bins], h, sp, bins);
             }
         }
     } else {
         for (int p = 0; p < parts_; ++p) {
+            const auto* history = history_slot(p);
             for (int s = 0; s < sources_; ++s) {
-                const auto* h = &history_[(p * sources_ + s) * bins];
+                const auto* h = history + s * bins;
                 for (int e = 0; e < ears_; ++e) {
                     const auto* sp = &spectra_[((p * sources_ + s) * ears_ + e) * bins];
                     complex_mac(&accum_[e * bins], h, sp, bins);
@@ -1006,6 +1012,9 @@ void Renderer::reset() {
 #endif
     dynamics_.reset();
     clock_ = 0.0;
+    route_changed_ = false;
+    route_fade_left_ = 0;
+    last_render_sample_ = {};
     surround_seen_ = -1e9;
     is_surround_ = false;
     fifo_fill_ = 0;
@@ -1029,6 +1038,8 @@ void Renderer::set_profile(Profile p) {
 }
 
 void Renderer::set_device(DeviceKind d) {
+    if (d == device_) return;
+    route_changed_ = clock_ > 0.0;
     device_ = d;
 }
 
@@ -1055,6 +1066,21 @@ void Renderer::set_scene_adapter(bool enabled) {
         }
     }
     scene_adapter_ = enabled;
+}
+
+void Renderer::set_models_paused(bool paused) {
+    if (models_paused_ == paused) return;
+    models_paused_ = paused;
+    if (paused) release_models();
+}
+
+void Renderer::release_models() {
+#ifdef ALLY_ENABLE_NPU
+    vocals_.release_for_idle();
+#endif
+#ifdef ALLY_ENABLE_AUTO_EQ
+    auto_eq_.release_for_idle();
+#endif
 }
 
 bool Renderer::detect_surround() {
@@ -1086,14 +1112,14 @@ void Renderer::make_stereo_feeds(bool& has_lfe) {
 #ifdef ALLY_ENABLE_NPU
     std::array<float, 2 * kHop> dialogue_lfe;
     if (neural_ && (profile_ == Profile::Speech || profile_ == Profile::Movie)) {
-        vocals_.note_hop(&block_[0]);
+        if (!models_paused_) vocals_.note_hop(&block_[0]);
     }
     // The separator path is taken from the first block, not once the model is ready:
     // it carries its delay line and plays the passive matrix while the model loads in
     // the background, so readiness changes nothing audible. Only a failed load falls
     // back to the undelayed path below.
     if (neural_ && profile_ == Profile::Speech &&
-        (vocals_.ensure_loaded(speech_model_path(), true) || !vocals_.failed())) {
+        ((!models_paused_ && vocals_.ensure_loaded(speech_model_path(), true)) || !vocals_.failed())) {
         // Speech model: keep the voice, tuck everything else away. No room, no air -
         // the stereo path below only has to place it.
         std::array<float, 2 * kHop> dry{};
@@ -1105,7 +1131,7 @@ void Renderer::make_stereo_feeds(bool& has_lfe) {
         }
     }
     if (neural_ && profile_ == Profile::Movie &&
-        (vocals_.ensure_loaded(vocals_model_path(), true) || !vocals_.failed())) {
+        ((!models_paused_ && vocals_.ensure_loaded(vocals_model_path(), true)) || !vocals_.failed())) {
         constexpr float kVoiceToCentre = 0.75f;
         std::array<float, 2 * kHop> dry{};
         std::array<float, 2 * kHop> sep_rest{};
@@ -1403,7 +1429,7 @@ void Renderer::process_hop() {
         downmix(out_l, out_r);
     } else {
 #ifdef ALLY_ENABLE_AUTO_EQ
-        if (auto_eq_.enabled()) {
+        if (!models_paused_ && auto_eq_.enabled()) {
             downmix(out_l, out_r);
             auto_eq_.observe(out_l, out_r);
         }
@@ -1433,6 +1459,20 @@ void Renderer::process_hop() {
         auto_eq_.apply(out_l, out_r);
 #endif
     }
+
+    // Bridge the waveform across a live route change before the dynamics delay.
+    const int fade_frames = std::max(kHop, static_cast<int>(sample_rate_ * 0.006f));
+    if (route_changed_) {
+        route_changed_ = false;
+        route_fade_left_ = fade_frames;
+        route_fade_delta_ = {last_render_sample_[0] - out_l[0], last_render_sample_[1] - out_r[0]};
+    }
+    for (int i = 0; i < kHop && route_fade_left_ > 0; ++i, --route_fade_left_) {
+        const float weight = static_cast<float>(route_fade_left_) / fade_frames;
+        out_l[i] += route_fade_delta_[0] * weight * weight;
+        out_r[i] += route_fade_delta_[1] * weight * weight;
+    }
+    last_render_sample_ = {out_l[kHop - 1], out_r[kHop - 1]};
 
     const auto cfg = get_profile_params(profile_);
     bool dynamic = cfg.compress || (device_ != DeviceKind::Headphones);

@@ -84,6 +84,7 @@ private:
     int sources_ = 0;
     int ears_ = 0;
     int parts_ = 0;
+    int history_head_ = 0;
     bool diagonal_ = false;
     RealFFT fft_{2 * kHop};
     std::vector<std::complex<float>> spectra_;  // [parts, sources, ears, bins]
@@ -255,19 +256,16 @@ public:
     // Output is always interleaved stereo float frames.
     void process_interleaved(const float* in, float* out, int frames, int in_channels);
 
-    // The host had no audio for `frames` frames: lets the separator unload when idle.
-    void idle(int frames) {
-        (void)frames;
-#ifdef ALLY_ENABLE_NPU
-        vocals_.idle(frames);
-#endif
-#ifdef ALLY_ENABLE_AUTO_EQ
-        auto_eq_.idle(frames);
-#endif
-    }
+    void set_models_paused(bool paused);
+    void release_models();
 
 private:
     float sample_rate_ = 48000.0f;
+    bool models_paused_ = false;
+    bool route_changed_ = false;
+    int route_fade_left_ = 0;
+    std::array<float, 2> route_fade_delta_{};
+    std::array<float, 2> last_render_sample_{};
     Profile profile_ = Profile::Game;
     DeviceKind device_ = DeviceKind::Headphones;
     bool reverb_ = true;

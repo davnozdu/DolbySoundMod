@@ -1,5 +1,13 @@
+import android.media.AudioAttributes;
+import android.media.AudioDeviceInfo;
 import android.media.audiofx.AudioEffect;
+import android.os.Binder;
+import android.os.FileObserver;
 import android.os.IBinder;
+import android.os.Parcel;
+import android.os.RemoteException;
+import android.os.SystemClock;
+import android.util.Log;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
@@ -9,12 +17,12 @@ import java.io.RandomAccessFile;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.nio.channels.FileLock;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.UUID;
 
 public class AllySoundCtl {
@@ -45,12 +53,19 @@ public class AllySoundCtl {
         int autoEq;
         int sceneAdapter;
         int device;
+        long releaseAt;
+        boolean modelsPaused;
     }
 
     private static final Map<Integer, SessionEffect> active = new HashMap<>();
     private static final Map<Integer, Long> failedAt = new HashMap<>();
-    private static final Map<Integer, Long> lastSeen = new HashMap<>();
     private static final long SESSION_GRACE_MS = 15000;
+    private static final long MODEL_PAUSE_MS = 500;
+    private static final long ROUTE_CONFIRM_MS = 250;
+    private static final int MODELS_RESUME = 15000;
+    private static final int MODELS_PAUSE = 15001;
+    private static final long ACTIVE_REFRESH_MS = 1500;
+    private static final long FALLBACK_IDLE_MS = 5000;
 
     private static int parseProfile(String s) {
         if (s == null) return 0;
@@ -113,28 +128,6 @@ public class AllySoundCtl {
         }
     }
 
-    private static int readNeuralEnabled() {
-        File f = new File(NEURAL_CONF);
-        if (!f.exists()) return 0;
-        try (BufferedReader br = new BufferedReader(new FileReader(f))) {
-            String line = br.readLine();
-            return (line != null && "1".equals(line.trim())) ? 1 : 0;
-        } catch (Exception e) {
-            return 0;
-        }
-    }
-
-    private static int readReverbEnabled() {
-        File f = new File(REVERB_CONF);
-        if (!f.exists()) return 0;
-        try (BufferedReader br = new BufferedReader(new FileReader(f))) {
-            String line = br.readLine();
-            return (line != null && "1".equals(line.trim())) ? 1 : 0;
-        } catch (Exception e) {
-            return 0;
-        }
-    }
-
     private static int readToggle(String path) {
         return readToggleDefault(path, 0);
     }
@@ -150,8 +143,61 @@ public class AllySoundCtl {
         }
     }
 
+    private static Method getMediaDevices;
+    private static Method getDeviceType;
+    private static Method getDeviceName;
+    private static final AudioAttributes MEDIA_ATTRIBUTES = new AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA).build();
+
+    private static boolean isGlasses(String name) {
+        String low = name.toLowerCase(java.util.Locale.ROOT);
+        return low.contains("xreal") || low.contains("nreal") ||
+               low.contains("viture") || low.contains("rokid");
+    }
+
     private static int detectOutputDevice(String mode) {
         if (!"auto".equals(mode)) return parseDevice(mode);
+        try {
+            if (getMediaDevices == null) {
+                Class<?> deviceClass = Class.forName("android.media.AudioDeviceAttributes");
+                getDeviceType = deviceClass.getMethod("getType");
+                getDeviceName = deviceClass.getMethod("getName");
+                getMediaDevices = Class.forName("android.media.AudioSystem")
+                        .getMethod("getDevicesForAttributes", AudioAttributes.class, boolean.class);
+            }
+            List<?> devices = (List<?>) getMediaDevices.invoke(null, MEDIA_ATTRIBUTES, true);
+            boolean needsDeviceName = false;
+            for (Object item : devices) {
+                switch ((Integer) getDeviceType.invoke(item)) {
+                    case AudioDeviceInfo.TYPE_BLUETOOTH_A2DP:
+                    case AudioDeviceInfo.TYPE_BLUETOOTH_SCO:
+                    case AudioDeviceInfo.TYPE_BLE_HEADSET:
+                    case AudioDeviceInfo.TYPE_BLE_BROADCAST:
+                    case AudioDeviceInfo.TYPE_WIRED_HEADSET:
+                    case AudioDeviceInfo.TYPE_WIRED_HEADPHONES:
+                    case AudioDeviceInfo.TYPE_HEARING_AID:
+                    case AudioDeviceInfo.TYPE_USB_HEADSET:
+                        return 0;
+                    case AudioDeviceInfo.TYPE_USB_DEVICE:
+                    case AudioDeviceInfo.TYPE_USB_ACCESSORY:
+                    case AudioDeviceInfo.TYPE_HDMI:
+                    case AudioDeviceInfo.TYPE_HDMI_ARC:
+                    case AudioDeviceInfo.TYPE_HDMI_EARC:
+                        if (isGlasses((String) getDeviceName.invoke(item))) return 2;
+                        needsDeviceName = true;
+                        break;
+                    default:
+                        break;
+                }
+            }
+            if (!devices.isEmpty() && !needsDeviceName) return 1;
+        } catch (Exception ignored) {
+            // Older vendor frameworks may expose only the dump.
+        }
+        return detectOutputDeviceFromDump();
+    }
+
+    private static int detectOutputDeviceFromDump() {
         // Use the route of STREAM_MUSIC ("- STREAM_MUSIC:" ... "Devices: speaker(2)").
         // Scanning the whole dump for "a2dp" matched Bluetooth history lines
         // ("A2DP device ... made unavailable") and put the headphone HRTF on the
@@ -166,7 +212,7 @@ public class AllySoundCtl {
             boolean inMusic = false;
             while ((line = br.readLine()) != null) {
                 String low = line.toLowerCase();
-                if (low.contains("xreal") || low.contains("nreal") || low.contains("viture") || low.contains("rokid")) {
+                if (isGlasses(low)) {
                     sawGlasses = true;
                 }
                 if (low.trim().startsWith("- stream_music:")) {
@@ -179,11 +225,11 @@ public class AllySoundCtl {
                 }
             }
         } catch (Exception e) {
-            return 1;
+            return -1;
         } finally {
             if (p != null) p.destroy();
         }
-        if (route == null || route.isEmpty()) return 1; // unknown: phone speaker is the safe guess
+        if (route == null || route.isEmpty()) return -1;
         if (route.contains("a2dp") || route.contains("bt_sco") || route.contains("ble_headset") ||
             route.contains("ble_broadcast") || route.contains("headset") || route.contains("headphone") ||
             route.contains("hearing_aid")) {
@@ -244,11 +290,13 @@ public class AllySoundCtl {
     private static Map<Integer, String> readActiveSessions() {
         Map<Integer, String> sessions = new HashMap<>();
         StringBuilder log = new java.io.File(BASE_DIR + "/debug").exists() ? new StringBuilder() : null;
+        boolean hasPlaybackMonitor = false;
         try {
             Process p = Runtime.getRuntime().exec(new String[]{"dumpsys", "audio"});
             BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()));
             String line;
             while ((line = br.readLine()) != null) {
+                if (line.startsWith("### Playback activity")) hasPlaybackMonitor = true;
                 if (!line.contains("state:started")) continue;
                 if (log != null) log.append("hit: ").append(line).append('\n');
                 int sid = intAfter(line, "sessionId:");
@@ -282,7 +330,7 @@ public class AllySoundCtl {
         } catch (Exception e) {
             if (log != null) log.append("audio dump failed: ").append(e).append('\n');
         }
-        if (!sessions.isEmpty()) {
+        if (hasPlaybackMonitor || !sessions.isEmpty()) {
             writeDebug(log, sessions);
             return sessions;
         }
@@ -330,32 +378,90 @@ public class AllySoundCtl {
         return sessions;
     }
 
-    // Fast path: ask the audio service for its playback configurations over binder.
-    // One call costs well under a millisecond, against 40-90 ms for `dumpsys audio`,
-    // so new playbacks can be picked up every 250 ms and the effect attaches within
-    // a fraction of a second of the track starting.
+    private static final int PLAYBACK_CHANGED = 1;
+    private static final int CONFIG_CHANGED = 2;
+    private static final int AUDIO_SERVICE_DIED = 4;
+    private static final int PLAYER_STATE_STARTED = 2;
+    private static final String PLAYBACK_DISPATCHER = "android.media.IPlaybackConfigDispatcher";
+
+    private static class ControllerEvents extends Binder {
+        private int pending = CONFIG_CHANGED;
+
+        ControllerEvents() {
+            attachInterface(null, PLAYBACK_DISPATCHER);
+        }
+
+        @Override
+        protected boolean onTransact(int code, Parcel data, Parcel reply, int flags)
+                throws RemoteException {
+            // dispatchPlaybackConfigChange is the first and only AIDL method.
+            if (code != FIRST_CALL_TRANSACTION) return super.onTransact(code, data, reply, flags);
+            data.enforceInterface(PLAYBACK_DISPATCHER);
+            signal(PLAYBACK_CHANGED);
+            return true;
+        }
+
+        synchronized void signal(int event) {
+            pending |= event;
+            notifyAll();
+        }
+
+        synchronized int await(long deadline) throws InterruptedException {
+            while (pending == 0) {
+                if (deadline == Long.MAX_VALUE) {
+                    wait();
+                } else {
+                    long remaining = deadline - SystemClock.elapsedRealtime();
+                    if (remaining <= 0) break;
+                    wait(remaining);
+                }
+            }
+            int events = pending;
+            pending = 0;
+            return events;
+        }
+    }
+
     private static Object audioService;
     private static Method getPlaybackConfigs;
-    private static boolean fastSessionsBroken;
-    private static final int PLAYER_STATE_STARTED = 2;
+    private static Method getPlayerState;
+    private static Method getSessionId;
+    private static Method getClientPid;
 
-    private static Map<Integer, String> readSessionsFast() throws Exception {
-        if (getPlaybackConfigs == null) {
+    private static boolean connectAudioService(ControllerEvents events) {
+        try {
             Class<?> serviceManager = Class.forName("android.os.ServiceManager");
             IBinder binder = (IBinder) serviceManager.getMethod("getService", String.class).invoke(null, "audio");
             Class<?> stub = Class.forName("android.media.IAudioService$Stub");
             audioService = stub.getMethod("asInterface", IBinder.class).invoke(null, binder);
+            Class<?> type = Class.forName("android.media.AudioPlaybackConfiguration");
+            getPlayerState = type.getMethod("getPlayerState");
+            getSessionId = type.getMethod("getSessionId");
+            getClientPid = type.getMethod("getClientPid");
             getPlaybackConfigs = audioService.getClass().getMethod("getActivePlaybackConfigurations");
+            binder.linkToDeath(() -> events.signal(AUDIO_SERVICE_DIED), 0);
+
+            Class<?> dispatcher = Class.forName(PLAYBACK_DISPATCHER);
+            Class<?> dispatcherStub = Class.forName(PLAYBACK_DISPATCHER + "$Stub");
+            Object callback = dispatcherStub.getMethod("asInterface", IBinder.class).invoke(null, events);
+            audioService.getClass().getMethod("registerPlaybackCallback", dispatcher)
+                    .invoke(audioService, callback);
+            return true;
+        } catch (Exception e) {
+            Log.w("AllySoundCtl", "Playback callbacks unavailable; using polling", e);
+            return false;
         }
+    }
+
+    private static Map<Integer, String> readSessionsFast() throws Exception {
         Map<Integer, String> sessions = new HashMap<>();
         List<?> configs = (List<?>) getPlaybackConfigs.invoke(audioService);
         if (configs == null) return sessions;
         for (Object config : configs) {
-            Class<?> type = config.getClass();
-            int state = (Integer) type.getMethod("getPlayerState").invoke(config);
+            int state = (Integer) getPlayerState.invoke(config);
             if (state != PLAYER_STATE_STARTED) continue;
-            int sid = (Integer) type.getMethod("getSessionId").invoke(config);
-            int pid = (Integer) type.getMethod("getClientPid").invoke(config);
+            int sid = (Integer) getSessionId.invoke(config);
+            int pid = (Integer) getClientPid.invoke(config);
             // An anonymized list (pid -1 for a playing track) is useless: let the
             // caller fall back to dumpsys for good.
             if (pid <= 0) throw new IllegalStateException("anonymized playback configs");
@@ -385,14 +491,36 @@ public class AllySoundCtl {
 
     private static void setAllyParam(AudioEffect fx, int profile, int neural, int reverb,
                                      int upmix, int autoEq, int sceneAdapter, int device) throws Exception {
-        Method setParam = AudioEffect.class.getDeclaredMethod("setParameter", int.class, int.class);
-        setParam.setAccessible(true);
         int flags = sceneAdapter * 4 + autoEq * 2 + upmix;
         int code = 50000 + flags * 10000 + profile * 1000 + neural * 100 + reverb * 10 + device;
-        setParam.invoke(fx, 0 /* PARAM_TARGET_GAIN_MB */, code);
+        sendGainCode(fx, code);
     }
 
-    private static void writeStatus(int device, String error) {
+    private static void setModelsPaused(SessionEffect session, boolean paused) throws Exception {
+        if (session.modelsPaused == paused) return;
+        sendGainCode(session.effect, paused ? MODELS_PAUSE : MODELS_RESUME);
+        session.modelsPaused = paused;
+    }
+
+    private static void sendGainCode(AudioEffect fx, int code) throws Exception {
+        Method setParam = AudioEffect.class.getDeclaredMethod("setParameter", int.class, int.class);
+        setParam.setAccessible(true);
+        int result = (Integer) setParam.invoke(fx, 0 /* PARAM_TARGET_GAIN_MB */, code);
+        if (result != AudioEffect.SUCCESS) {
+            throw new IllegalStateException("AudioEffect.setParameter returned " + result);
+        }
+    }
+
+    private static void releaseEffect(AudioEffect effect) {
+        try {
+            effect.setEnabled(false);
+        } catch (Exception ignored) {}
+        try {
+            effect.release();
+        } catch (Exception ignored) {}
+    }
+
+    private static String writeStatus(int device, String error, String previous) {
         StringBuilder sb = new StringBuilder();
         sb.append("{\"running\":true,\"device\":").append(device);
         if (error != null) {
@@ -411,47 +539,75 @@ public class AllySoundCtl {
               .append(",\"upmix\":").append(se.upmix != 0)
               .append(",\"auto_eq\":").append(se.autoEq != 0)
               .append(",\"scene_adapter\":").append(se.sceneAdapter != 0)
-              .append(",\"neural\":").append(se.neural != 0).append("}");
+              .append(",\"neural\":").append(se.neural != 0)
+              .append(",\"paused\":").append(se.modelsPaused).append("}");
         }
         sb.append("]}");
-        try (FileWriter fw = new FileWriter(STATUS_JSON)) {
-            fw.write(sb.toString());
-        } catch (Exception ignored) {}
+        String status = sb.toString();
+        if (status.equals(previous)) return previous;
+        File file = new File(STATUS_JSON);
+        File temp = new File(STATUS_JSON + ".new");
+        try {
+            try (FileWriter fw = new FileWriter(temp)) {
+                fw.write(status);
+            }
+            Files.move(temp.toPath(), file.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            return status;
+        } catch (Exception e) {
+            Log.w("AllySoundCtl", "Could not write status", e);
+            return previous;
+        }
     }
 
     public static void main(String[] args) {
         new File(BASE_DIR).mkdirs();
-        // Single instance only: the service.sh supervisor restarts us every 3s,
-        // and two controllers would attach two effects to the same session.
-        RandomAccessFile lockFile = null;
-        FileLock lock = null;
-        try {
-            lockFile = new RandomAccessFile(BASE_DIR + "/ctl.lock", "rw");
-            lock = lockFile.getChannel().tryLock();
-            if (lock == null) {
-                return;
-            }
-        } catch (Exception ignored) {
-            // lock is best effort; never block the controller
+        // Hold the lock for the whole controller lifetime, including asynchronous callbacks.
+        try (RandomAccessFile lockFile = new RandomAccessFile(BASE_DIR + "/ctl.lock", "rw");
+             FileLock lock = lockFile.getChannel().tryLock()) {
+            if (lock != null) runController();
+        } catch (Exception e) {
+            Log.e("AllySoundCtl", "Controller stopped", e);
         }
+        // app_process also runs a Binder thread pool. Terminate it so service.sh can restart us.
+        System.exit(0);
+    }
+
+    private static void runController() {
+        ControllerEvents events = new ControllerEvents();
+        FileObserver observer = new FileObserver(new File(BASE_DIR), FileObserver.CLOSE_WRITE |
+                FileObserver.MOVED_TO | FileObserver.MOVED_FROM | FileObserver.DELETE) {
+            @Override
+            public void onEvent(int event, String path) {
+                if (path != null && path.endsWith(".conf")) events.signal(CONFIG_CHANGED);
+            }
+        };
+        observer.startWatching();
+        boolean playbackCallbacks = connectAudioService(events);
+        if (playbackCallbacks) Log.i("AllySoundCtl", "Watching playback and configuration changes");
+
         String lastError = null;
-        // Sessions are polled every 250 ms over binder; settings, the output device
-        // (`dumpsys audio`) and the status file are refreshed every 1.5 s.
-        long tick = 0;
-        Map<String, Integer> apps = null;
-        int device = 0, neural = 0, upmix = 0, autoEq = 0;
+        String lastStatus = null;
+        String deviceMode = "auto";
+        long nextRefresh = 0;
+        long deadline = 0;
+        long candidateSince = 0;
+        int routeCandidate = -1;
+        Map<String, Integer> apps = new HashMap<>();
+        int device = 1, neural = 0, upmix = 0, autoEq = 0;
         int reverbMusic = 1, reverbMovie = 0, reverbPodcast = 0;
         int sceneMusic = 1, sceneMovie = 0, scenePodcast = 0;
         while (true) {
             try {
-                final boolean refresh = tick++ % 6 == 0 || apps == null;
-                if (refresh) {
+                int changes = events.await(deadline);
+                if ((changes & AUDIO_SERVICE_DIED) != 0) break;
+                final boolean configChanged = (changes & CONFIG_CHANGED) != 0;
+                if (configChanged) {
                     apps = readAppsConf();
-                    device = detectOutputDevice(readDeviceMode());
-                    neural = readNeuralEnabled();
-                    int legacyReverb = readReverbEnabled();
+                    deviceMode = readDeviceMode();
+                    neural = readToggle(NEURAL_CONF);
                     reverbMusic = readToggleDefault(REVERB_MUSIC_CONF, 1);
-                    reverbMovie = readToggleDefault(REVERB_MOVIE_CONF, legacyReverb);
+                    reverbMovie = readToggleDefault(REVERB_MOVIE_CONF, readToggle(REVERB_CONF));
                     reverbPodcast = readToggleDefault(REVERB_PODCAST_CONF, 0);
                     sceneMusic = readToggleDefault(SCENE_MUSIC_CONF, 1);
                     sceneMovie = readToggleDefault(SCENE_MOVIE_CONF, 0);
@@ -460,60 +616,78 @@ public class AllySoundCtl {
                     autoEq = readToggle(AUTO_EQ_CONF);
                 }
                 Map<Integer, String> sessions = null;
-                if (!fastSessionsBroken) {
+                if (getPlaybackConfigs != null) {
                     try {
                         sessions = readSessionsFast();
-                    } catch (Throwable t) {
-                        fastSessionsBroken = true;   // fall back to dumpsys for good
+                    } catch (Exception e) {
+                        getPlaybackConfigs = null;
+                        playbackCallbacks = false;
+                        Log.w("AllySoundCtl", "Playback configurations unavailable; using dumpsys", e);
                     }
                 }
-                if (sessions == null) {
-                    if (!refresh) {
-                        Thread.sleep(250);
-                        continue;
+                if (sessions == null) sessions = readActiveSessions();
+                for (Iterator<String> packages = sessions.values().iterator(); packages.hasNext();) {
+                    if (!apps.containsKey(packages.next())) packages.remove();
+                }
+                failedAt.keySet().retainAll(sessions.keySet());
+
+                final long now = SystemClock.elapsedRealtime();
+                final boolean watchingPlayback = !sessions.isEmpty();
+                if (configChanged || (watchingPlayback && now >= nextRefresh)) {
+                    int detected = detectOutputDevice(deviceMode);
+                    nextRefresh = now + ACTIVE_REFRESH_MS;
+                    if (detected < 0 || detected == device) {
+                        routeCandidate = -1;
+                    } else if (active.isEmpty() || !"auto".equals(deviceMode) ||
+                               (detected == routeCandidate && now - candidateSince >= ROUTE_CONFIRM_MS)) {
+                        device = detected;
+                        routeCandidate = -1;
+                    } else {
+                        if (detected != routeCandidate) candidateSince = now;
+                        routeCandidate = detected;
+                        nextRefresh = candidateSince + ROUTE_CONFIRM_MS;
                     }
-                    sessions = readActiveSessions();
+                }
+                if (!watchingPlayback) {
+                    nextRefresh = 0;
+                    routeCandidate = -1;
                 }
 
-                // Remove stale or disabled sessions. A session that merely stopped
-                // playing (pause, the gap between two tracks) keeps its effect for
-                // SESSION_GRACE_MS, so resuming or the next track does not attach a
-                // new effect and start it from scratch.
-                final long now = System.currentTimeMillis();
-                for (int sid : sessions.keySet()) lastSeen.put(sid, now);
+                deadline = watchingPlayback ? nextRefresh : Long.MAX_VALUE;
+                if (!playbackCallbacks) deadline = Math.min(deadline, now + FALLBACK_IDLE_MS);
+
+                // Keep a paused session attached briefly so resuming keeps its DSP state.
                 Iterator<Map.Entry<Integer, SessionEffect>> it = active.entrySet().iterator();
                 while (it.hasNext()) {
                     Map.Entry<Integer, SessionEffect> entry = it.next();
-                    int sid = entry.getKey();
                     SessionEffect se = entry.getValue();
-                    String pkg = sessions.get(sid);
-                    if (pkg == null) {
-                        Long seen = lastSeen.get(sid);
-                        if (seen != null && now - seen < SESSION_GRACE_MS && apps.get(se.pkg) != null) continue;
+                    String pkg = sessions.get(entry.getKey());
+                    if (se.pkg.equals(pkg)) {
+                        se.releaseAt = 0;
+                        setModelsPaused(se, false);
+                        continue;
                     }
-                    Integer wantedProf = (pkg != null) ? apps.get(pkg) : null;
-                    if (pkg == null || wantedProf == null || wantedProf == 0) {
-                        lastSeen.remove(sid);
-                        try {
-                            se.effect.setEnabled(false);
-                            se.effect.release();
-                        } catch (Exception ignored) {}
-                        it.remove();
+                    if (pkg == null && apps.containsKey(se.pkg)) {
+                        if (se.releaseAt == 0) se.releaseAt = now + SESSION_GRACE_MS;
+                        if (se.releaseAt > now) {
+                            deadline = Math.min(deadline, se.releaseAt);
+                            long pauseAt = se.releaseAt - SESSION_GRACE_MS + MODEL_PAUSE_MS;
+                            if (now >= pauseAt) {
+                                setModelsPaused(se, true);
+                            } else {
+                                deadline = Math.min(deadline, pauseAt);
+                            }
+                            continue;
+                        }
                     }
+                    releaseEffect(se.effect);
+                    it.remove();
                 }
 
-                Iterator<Map.Entry<Integer, Long>> seenIt = lastSeen.entrySet().iterator();
-                while (seenIt.hasNext()) {
-                    Map.Entry<Integer, Long> seen = seenIt.next();
-                    if (now - seen.getValue() > SESSION_GRACE_MS && !active.containsKey(seen.getKey())) seenIt.remove();
-                }
-
-                // Attach or update matching sessions
-                Set<Integer> keys = new HashSet<>(sessions.keySet());
-                for (int sid : keys) {
-                    String pkg = sessions.get(sid);
-                    Integer prof = apps.get(pkg);
-                    if (prof == null || prof == 0) continue;
+                for (Map.Entry<Integer, String> session : sessions.entrySet()) {
+                    int sid = session.getKey();
+                    String pkg = session.getValue();
+                    int prof = apps.get(pkg);
 
                     int sessReverb = (prof == 3) ? reverbMusic
                                    : (prof == 4 ? reverbPodcast : reverbMovie);
@@ -525,11 +699,15 @@ public class AllySoundCtl {
                         // Do not hammer AudioFlinger: one attempt per 15 s per session
                         // while the effect cannot be created.
                         Long failed = failedAt.get(sid);
-                        if (failed != null && System.currentTimeMillis() - failed < 15000) continue;
+                        if (failed != null && now - failed < SESSION_GRACE_MS) continue;
+                        AudioEffect fx = null;
                         try {
-                            AudioEffect fx = createAllyEffect(sid);
+                            fx = createAllyEffect(sid);
                             setAllyParam(fx, prof, neural, sessReverb, upmix, autoEq, sessScene, device);
-                            fx.setEnabled(true);
+                            int result = fx.setEnabled(true);
+                            if (result != AudioEffect.SUCCESS) {
+                                throw new IllegalStateException("AudioEffect.setEnabled returned " + result);
+                            }
                             se = new SessionEffect();
                             se.effect = fx;
                             se.pkg = pkg;
@@ -544,7 +722,8 @@ public class AllySoundCtl {
                             failedAt.remove(sid);
                             lastError = null;
                         } catch (Exception e) {
-                            failedAt.put(sid, System.currentTimeMillis());
+                            if (fx != null) releaseEffect(fx);
+                            failedAt.put(sid, now);
                             lastError = e.getClass().getSimpleName() + ": " + e.getMessage();
                         }
                     } else if (se.profile != prof || se.neural != neural || se.reverb != sessReverb ||
@@ -565,17 +744,16 @@ public class AllySoundCtl {
                         }
                     }
                 }
-                if (refresh) writeStatus(device, lastError);
-            } catch (Exception e) {
-                lastError = e.getMessage();
-                writeStatus(0, lastError);
-            }
-
-            try {
-                Thread.sleep(250);
+                lastStatus = writeStatus(device, lastError, lastStatus);
             } catch (InterruptedException ignored) {
                 break;
+            } catch (Exception e) {
+                lastError = e.getClass().getSimpleName() + ": " + e.getMessage();
+                lastStatus = writeStatus(device, lastError, lastStatus);
+                deadline = SystemClock.elapsedRealtime() + ACTIVE_REFRESH_MS;
             }
         }
+        observer.stopWatching();
+        for (SessionEffect se : active.values()) releaseEffect(se.effect);
     }
 }

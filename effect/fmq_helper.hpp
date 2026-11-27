@@ -59,6 +59,11 @@ public:
         if (auto* word = queue_->getEventFlagWord()) {
             android::hardware::EventFlag::createEventFlag(word, &ef_);
         }
+        if (with_event_flag && !ef_) {
+            ALOGE("fmq: event flag init failed");
+            reset();
+            return false;
+        }
         return true;
     }
 
@@ -83,21 +88,11 @@ public:
         if (ef_) ef_->wake(bitmask);
     }
 
-    bool wait(uint32_t bitmask = 1, int timeout_ms = 50) {
-        if (!queue_) return false;
-        if (ef_) {
-            uint32_t ef_state = 0;
-            if (ef_->wait(bitmask, &ef_state, static_cast<int64_t>(timeout_ms) * 1000000LL,
-                          true /* retry */) != ::android::OK) {
-                return false;
-            }
-            return available_to_read() > 0;
-        }
-        // No event flag on this queue: yield instead of spinning, then report data.
-        // The caller picks the delay: a millisecond while audio is flowing, longer
-        // once the queue has been idle, so an idle effect does not burn the HAL thread.
-        usleep(static_cast<useconds_t>(timeout_ms > 0 ? timeout_ms : 1) * 1000);
-        return available_to_read() > 0;
+    bool wait(uint32_t bitmask, int timeout_ms) {
+        if (!ef_) return false;
+        uint32_t ef_state = 0;
+        return ef_->wait(bitmask, &ef_state, static_cast<int64_t>(timeout_ms) * 1000000LL,
+                         true /* retry */) == ::android::OK;
     }
 
 private:

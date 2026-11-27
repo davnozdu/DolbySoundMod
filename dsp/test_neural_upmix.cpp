@@ -11,6 +11,7 @@ namespace ally {
 PipelinedVocals::~PipelinedVocals() = default;
 bool PipelinedVocals::ensure_loaded(const char*, bool) { return true; }
 void PipelinedVocals::note_hop(const float*) {}
+void PipelinedVocals::release_for_idle() {}
 void PipelinedVocals::note_block_frames(int) {}
 void PipelinedVocals::process(const float* input, float* dry, float* rest, uint64_t) {
     for (int i = 0; i < kHop; ++i) {

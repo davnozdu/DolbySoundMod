@@ -16,6 +16,7 @@
 #include <mutex>
 #include <numeric>
 #include <thread>
+#include <utility>
 #include <unistd.h>
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -56,7 +57,7 @@ constexpr double kPi = 3.14159265358979323846;
 constexpr int kRestWindows = 20;
 constexpr int kMaxGenrePasses = 4;
 // Release the ONNX sessions (and their HTP context) after this much silence or no audio.
-constexpr float kIdleReleaseSeconds = 10.0f;
+constexpr float kIdleReleaseSeconds = 2.0f;
 #ifndef ALLY_EQ_MODEL_DIR
 #define ALLY_EQ_MODEL_DIR "/vendor/lib64/soundfx/"
 #endif
@@ -440,6 +441,7 @@ struct AutoEq::Impl {
     void request_release() {
         {
             std::lock_guard<std::mutex> lock(mutex);
+            pending = false;
             release = true;
         }
         cv.notify_one();
@@ -480,24 +482,33 @@ struct AutoEq::Impl {
             genre_passes = 0;
             group_sum = {};
         };
+        auto release_models = [&] {
+            if (!models) return;
+            models.reset();
+#ifdef __ANDROID__
+            __android_log_print(ANDROID_LOG_INFO, "AllyAutoEq", "classification models released");
+#endif
+        };
         while (true) {
-            uint64_t token;
+            uint64_t token = 0;
+            bool release_requested;
             {
                 std::unique_lock<std::mutex> lock(mutex);
                 cv.wait(lock, [&] { return stopping || pending || release; });
                 if (stopping) return;
-                if (release) {
-                    // Paused, stopped or switched off: give the memory back.
-                    release = false;
-                    models.reset();
-                    restart_genre();
-                    silent_windows = 0;
-                    if (!pending) continue;
+                release_requested = std::exchange(release, false);
+                if (pending) {
+                    pending = false;
+                    token = job_generation;
+                    window.swap(job);
                 }
-                pending = false;
-                token = job_generation;
-                window.swap(job);
             }
+            if (release_requested) {
+                release_models();
+                restart_genre();
+                silent_windows = 0;
+            }
+            if (token == 0) continue;
             if (token != previous) {
                 previous = token;
                 vote = Eq::Neutral;
@@ -510,7 +521,7 @@ struct AutoEq::Impl {
             const float rms = std::sqrt(energy / window.size());
             const bool audible = std::isfinite(rms) && rms >= 1e-5f;
             silent_windows = audible ? 0 : silent_windows + 1;
-            if (!audible && silent_windows >= idle_windows) models.reset();
+            if (!audible && silent_windows >= idle_windows) release_models();
 
             // Speech or music: every window (~1 s), in every profile. Films and games
             // change between dialogue, music and effects within seconds.
@@ -625,7 +636,6 @@ struct AutoEq::Impl {
     std::atomic<uint64_t> result{0};
     bool on = false, pending = false, stopping = false, release = false;
     std::atomic<bool> genre_wanted{false};  // music profile: refine music by genre
-    float idle_frames = 0.0f;        // audio thread: time without any audio callback
     std::mutex mutex;
     std::condition_variable cv;
     std::thread worker;
@@ -652,12 +662,10 @@ void AutoEq::reset() {
     impl_->reset_filter();
 }
 
-void AutoEq::idle(int frames) {
-    if (!impl_ || !impl_->on) return;
-    auto& state = *impl_;
-    const bool was_active = state.idle_frames < kIdleReleaseSeconds * rate_;
-    state.idle_frames += static_cast<float>(frames);
-    if (was_active && state.idle_frames >= kIdleReleaseSeconds * rate_) state.request_release();
+void AutoEq::release_for_idle() {
+    if (!enabled()) return;
+    impl_->invalidate();
+    impl_->request_release();
 }
 
 void AutoEq::set_genre(bool enabled) {
@@ -686,7 +694,6 @@ bool AutoEq::enabled() const {
 void AutoEq::observe(const float* left, const float* right) {
     if (!enabled() || impl_->profile() == Eq::Error) return;
     auto& state = *impl_;
-    state.idle_frames = 0.0f;
     for (int i = 0; i < kHop; ++i) {
         state.capture[state.filled++] = 0.5f * (left[i] + right[i]);
         if (state.filled != state.capture.size()) continue;

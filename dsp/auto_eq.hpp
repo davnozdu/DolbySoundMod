@@ -15,8 +15,8 @@ public:
     void set_genre(bool enabled);
     bool enabled() const;
     void observe(const float* left, const float* right);
-    // No audio callback for `frames` frames (paused/stopped): releases the models.
-    void idle(int frames);
+    // Discard stale analysis and release the models on the analysis worker.
+    void release_for_idle();
     void apply(float* left, float* right);
     const char* profile() const;
 

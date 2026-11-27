@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -29,7 +30,7 @@ public:
     // Silence handling, as in the Ally plugin: once the pipeline has drained the
     // model stops running, and after this long without sound it is unloaded.
     static constexpr float kSilenceRms = 1e-5f;      // -100 dBFS
-    static constexpr int kUnloadHops = 3750;         // ~10 s at 48 kHz
+    static constexpr int kUnloadHops = 750;          // ~2 s at 48 kHz
 
     PipelinedVocals() = default;
     ~PipelinedVocals();
@@ -41,7 +42,7 @@ public:
     // model on a background thread and returns false; it returns true once ready.
     bool ensure_loaded(const char* model_path, bool use_npu = true);
     bool is_ready() const { return ready_.load(); }
-    bool using_npu() const { return npu_active_.load(); }
+    bool using_npu() const { return is_ready() && npu_active_.load(); }
     bool failed() const { return failed_.load(); }
 
     // Tells the pipeline how many frames the host delivers per call so the delay
@@ -51,8 +52,8 @@ public:
     // Call once per hop with the stereo input (planar, 2 * kHop) before
     // ensure_loaded()/process(): tracks silence, gates inference, unloads when idle.
     void note_hop(const float* stereo_in);
-    // The host delivered no audio at all for `frames` frames (stream stopped).
-    void idle(int frames);
+    // Stop inference and release the model on its worker, including a load in progress.
+    void release_for_idle();
 
     // Non-blocking process: feeds one stereo hop (planar: 2 * kHop) and outputs
     // time-aligned dry (2 * kHop) and rest = dry - vocals (2 * kHop).
@@ -66,8 +67,9 @@ private:
     std::atomic<bool> failed_{false};
     std::atomic<bool> loading_{false};
     std::atomic<bool> npu_active_{false};
-    std::thread loader_;
-    std::string model_path_;
+    std::thread thread_;
+    std::mutex lifecycle_mutex_;
+    bool stop_requested_ = false; // protected by lifecycle_mutex_
 
     // Audio-thread only.
     int delay_hops_ = kMinDelayHops;
@@ -79,12 +81,11 @@ private:
     size_t delay_ring_ = 0;
     uint64_t delay_tick_ = UINT64_MAX;
     int silent_hops_ = 0;
+    bool previous_output_wet_ = false;
+    std::array<float, 2> dry_tail_{}, rest_tail_{};
 
-    void unload();
-    void teardown();
-
-    void load(bool use_npu);
-    void worker_loop();
+    void run(const std::string& model_path, bool use_npu);
+    void worker_loop(Impl& impl);
     static void passive_matrix(const float* dry, float* rest);
 };
 

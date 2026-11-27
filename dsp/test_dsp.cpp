@@ -41,6 +41,31 @@ int main() {
     }
     }
 
+    // Changing the output route during steady audio should not step the waveform.
+    {
+        constexpr int kBefore = 256 * ally::kHop;
+        constexpr int kAfter = 8 * ally::kHop;
+        constexpr int kBoundary = kBefore + 2 * ally::kHop - 1;
+        std::vector<float> input(2 * (kBefore + kAfter)), output(input.size());
+        for (int phase = 0; phase < 8; ++phase) {
+            ally::Renderer renderer;
+            renderer.init(48000.0f);
+            renderer.set_profile(ally::Profile::Music);
+            renderer.set_reverb(false);
+            for (int i = 0; i < kBefore + kAfter; ++i) {
+                input[2 * i] = 0.12f * std::sin(0.0061f * i + 0.7854f * phase);
+                input[2 * i + 1] = 0.10f * std::sin(0.0082f * i + 0.7854f * phase);
+            }
+            renderer.process_interleaved(input.data(), output.data(), kBefore, 2);
+            renderer.set_device(ally::DeviceKind::Speakers);
+            renderer.process_interleaved(input.data() + 2 * kBefore, output.data() + 2 * kBefore, kAfter, 2);
+            for (int channel = 0; channel < 2; ++channel) {
+                const int sample = 2 * kBoundary + channel;
+                assert(std::abs(output[sample] - output[sample - 2]) < 0.002f);
+            }
+        }
+    }
+
     // Scene adapter: verify 2.0 -> 7.1 music placement produces side & rear feeds.
     {
         ally::CoherenceUpmix u;

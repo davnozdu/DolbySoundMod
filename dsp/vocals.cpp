@@ -399,7 +399,6 @@ struct PipelinedVocals::Impl {
     std::mutex mutex;
     std::condition_variable cv;
     bool stop = false;
-    std::thread worker;
 
     std::deque<QueuedHop> inbox;
     std::deque<OutHop> outbox;
@@ -639,74 +638,61 @@ struct PipelinedVocals::Impl {
 };
 
 PipelinedVocals::~PipelinedVocals() {
-    if (loader_.joinable()) {
-        loader_.join();
-    }
-    teardown();
+    release_for_idle();
+    if (thread_.joinable()) thread_.join();
 }
 
-void PipelinedVocals::teardown() {
+void PipelinedVocals::release_for_idle() {
+    // Drop delayed audio from before a real pause so it cannot leak into resume.
+    delay_ring_ = 0;
+    previous_output_wet_ = false;
+    std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
+    stop_requested_ = true;
     if (!impl_) return;
-    {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        impl_->stop = true;
-    }
-    impl_->cv.notify_all();
-    if (impl_->worker.joinable()) {
-        impl_->worker.join();
-    }
-    release_model(impl_->m);
-    delete impl_;
+    Impl* stopped = impl_;
     impl_ = nullptr;
-}
-
-void PipelinedVocals::unload() {
-    // Only a finished load is torn down; one still in flight is left alone and
-    // unloaded on a later idle hop.
-    if (!ready_.load()) return;
-    if (loader_.joinable()) loader_.join();
     ready_.store(false);
-    teardown();
-    npu_active_.store(false);
-    loading_.store(false);
-    VLOGI("separator unloaded after %d silent hops", silent_hops_);
+    {
+        std::lock_guard<std::mutex> lock(stopped->mutex);
+        stopped->stop = true;
+        stopped->cv.notify_one();
+    }
 }
 
 void PipelinedVocals::note_hop(const float* stereo_in) {
     double e = 0.0;
     for (int i = 0; i < 2 * kHop; ++i) e += static_cast<double>(stereo_in[i]) * stereo_in[i];
     const bool silent = std::sqrt(e / (2 * kHop)) <= kSilenceRms;
-    silent_hops_ = silent ? std::min(silent_hops_ + 1, kUnloadHops) : 0;
-    if (silent_hops_ >= kUnloadHops) unload();
-}
-
-void PipelinedVocals::idle(int frames) {
-    silent_hops_ = std::min(silent_hops_ + std::max(1, frames / kHop), kUnloadHops);
-    if (silent_hops_ >= kUnloadHops) unload();
+    if (!silent) {
+        silent_hops_ = 0;
+    } else if (silent_hops_ < kUnloadHops && ++silent_hops_ == kUnloadHops) {
+        release_for_idle();
+    }
 }
 
 bool PipelinedVocals::ensure_loaded(const char* model_path, bool use_npu) {
     if (ready_.load()) return true;
-    if (failed_.load()) return false;
-    // Never load (or reload after an idle unload) for silence.
-    if (silent_hops_ > 0) return false;
-    // Loading ONNX Runtime and compiling the graph takes hundreds of milliseconds;
-    // doing it on the audio thread stalled playback the moment neural mode was
-    // switched on. Load in the background and keep the passive path meanwhile.
+    if (failed_.load() || silent_hops_ > 0) return false;
     if (!loading_.exchange(true)) {
-        model_path_ = model_path;
-        loader_ = std::thread([this, use_npu]() { load(use_npu); });
+        // The previous worker cleared loading_ after releasing its session.
+        if (thread_.joinable()) thread_.join();
+        {
+            std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+            stop_requested_ = false;
+        }
+        thread_ = std::thread([this, path = std::string(model_path), use_npu]() { run(path, use_npu); });
     }
     return false;
 }
 
-void PipelinedVocals::load(bool use_npu) {
-    SharedModel* m = acquire_model(model_path_.c_str(), use_npu);
-    if (m == nullptr) {
+void PipelinedVocals::run(const std::string& model_path, bool use_npu) {
+    SharedModel* m = acquire_model(model_path.c_str(), use_npu);
+    if (!m) {
         failed_.store(true);
+        loading_.store(false);
         return;
     }
-    auto* d = new Impl();
+    auto d = std::make_unique<Impl>();
     d->m = m;
     for (size_t sz : m->state_sizes) d->state_bufs.emplace_back(sz, 0.0f);
     if (m->split) {
@@ -737,10 +723,22 @@ void PipelinedVocals::load(bool use_npu) {
         d->reset_states();
         if (!d->batched) VLOGE("QNN warm-up failed; using the CPU separator");
     }
-    npu_active_.store(m->npu || d->batched);
-    impl_ = d;
-    d->worker = std::thread([this]() { worker_loop(); });
-    ready_.store(true); // publishes impl_ to the audio thread
+    bool published;
+    {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+        published = !stop_requested_;
+        if (published) {
+            impl_ = d.get();
+            npu_active_.store(m->npu || d->batched);
+            ready_.store(true); // publishes impl_ to the audio thread
+        }
+    }
+    if (published) worker_loop(*d);
+    d.reset();
+    release_model(m);
+    npu_active_.store(false);
+    VLOGI("separator released after playback became idle");
+    loading_.store(false);
 }
 
 void PipelinedVocals::note_block_frames(int frames) {
@@ -765,8 +763,8 @@ void PipelinedVocals::note_block_frames(int frames) {
     }
 }
 
-void PipelinedVocals::worker_loop() {
-    Impl* d = impl_; // set before this thread is started
+void PipelinedVocals::worker_loop(Impl& impl) {
+    Impl* d = &impl;
     uint64_t worker_gen = UINT64_MAX;
     uint32_t runs = 0;
     double run_ms_sum = 0.0, run_ms_max = 0.0;
@@ -850,10 +848,27 @@ void PipelinedVocals::process(const float* stereo_in, float* dry_out, float* res
     std::memcpy(slot, stereo_in, 2 * kHop * sizeof(float));
     delay_pos_ = (delay_pos_ + 1) % ring;
 
-    if (!ready_.load() || !impl_) {
-        // Still loading (or failed): the passive matrix, already on the model's delay.
+    auto render_passive = [&] {
         std::memcpy(dry_out, dry_ref.data(), 2 * kHop * sizeof(float));
         passive_matrix(dry_out, rest_out);
+        if (!previous_output_wet_) return;
+        // An inference miss used to jump straight from the separated signal to
+        // the passive matrix. Bridge one hop from the last emitted sample.
+        for (int channel = 0; channel < 2; ++channel) {
+            const int start = channel * kHop;
+            const float dry_delta = dry_tail_[channel] - dry_out[start];
+            const float rest_delta = rest_tail_[channel] - rest_out[start];
+            for (int i = 0; i < kHop; ++i) {
+                const float weight = 1.0f - static_cast<float>(i) / kHop;
+                dry_out[start + i] += dry_delta * weight * weight;
+                rest_out[start + i] += rest_delta * weight * weight;
+            }
+        }
+        previous_output_wet_ = false;
+    };
+    if (!ready_.load() || !impl_) {
+        // Keep the passive path on the same delay while the model loads.
+        render_passive();
         return;
     }
     Impl* d = impl_;
@@ -861,8 +876,7 @@ void PipelinedVocals::process(const float* stereo_in, float* dry_out, float* res
     // the model is not run at all. The tick gap makes the pipeline resync and fade
     // the model back in when sound returns.
     if (silent_hops_ > delay_hops_ + 2) {
-        std::memset(dry_out, 0, 2 * kHop * sizeof(float));
-        std::memset(rest_out, 0, 2 * kHop * sizeof(float));
+        render_passive();
         return;
     }
     d->stat_hops.fetch_add(1, std::memory_order_relaxed);
@@ -897,8 +911,7 @@ void PipelinedVocals::process(const float* stereo_in, float* dry_out, float* res
     d->cv.notify_one();
 
     if (cur_seq < ring) {
-        std::memcpy(dry_out, dry_ref.data(), 2 * kHop * sizeof(float));
-        passive_matrix(dry_out, rest_out);
+        render_passive();
         return;
     }
 
@@ -929,8 +942,7 @@ void PipelinedVocals::process(const float* stereo_in, float* dry_out, float* res
 
     if (!got) {
         d->wet = 0.0f;
-        std::memcpy(dry_out, dry_ref.data(), 2 * kHop * sizeof(float));
-        passive_matrix(dry_out, rest_out);
+        render_passive();
         return;
     }
 
@@ -947,6 +959,9 @@ void PipelinedVocals::process(const float* stereo_in, float* dry_out, float* res
         }
         d->wet = end;
     }
+    previous_output_wet_ = true;
+    dry_tail_ = {dry_out[kHop - 1], dry_out[2 * kHop - 1]};
+    rest_tail_ = {rest_out[kHop - 1], rest_out[2 * kHop - 1]};
 }
 
 } // namespace ally

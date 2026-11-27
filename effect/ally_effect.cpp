@@ -160,6 +160,7 @@ public:
     ndk::ScopedAStatus open(const Parameter::Common& common,
                             const std::optional<Parameter::Specific>& specific,
                             OpenEffectReturn* _aidl_return) override {
+        std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
         std::unique_lock<std::mutex> lock(mutex_);
         stop_worker_locked(lock);
 
@@ -180,6 +181,7 @@ public:
         renderer_.set_upmix(upmix_.load());
         renderer_.set_scene_adapter(scene_adapter_.load());
         renderer_.set_auto_eq(auto_eq_.load());
+        renderer_.set_models_paused(true);
 
         if (specific.has_value()) {
             apply_specific_locked(*specific);
@@ -222,6 +224,7 @@ public:
     }
 
     ndk::ScopedAStatus close() override {
+        std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
         std::unique_lock<std::mutex> lock(mutex_);
         stop_worker_locked(lock);
         status_mq_.reset();
@@ -242,12 +245,14 @@ public:
             case CommandId::START:
                 if (state_.load() == State::IDLE) {
                     state_.store(State::PROCESSING);
+                    renderer_.set_models_paused(models_paused_);
                     ALOGI("command: START -> PROCESSING");
                 }
                 break;
             case CommandId::STOP:
                 if (state_.load() == State::PROCESSING) {
                     state_.store(State::IDLE);
+                    renderer_.set_models_paused(true);
                     ALOGI("command: STOP -> IDLE");
                 }
                 break;
@@ -270,8 +275,11 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         if (param.getTag() == Parameter::common) {
             common_ = param.get<Parameter::common>();
-            if (common_.input.base.sampleRate > 0) {
+            if (common_.input.base.sampleRate > 0 &&
+                sample_rate_ != static_cast<float>(common_.input.base.sampleRate)) {
                 sample_rate_ = static_cast<float>(common_.input.base.sampleRate);
+                if (state_.load() != State::INIT) renderer_.init(sample_rate_);
+                renderer_.set_bypass(sample_rate_ > 50000.0f);
             }
             in_channels_ = std::max(1, channel_count_from_layout(common_.input.base.channelMask));
             out_channels_ = std::max(1, channel_count_from_layout(common_.output.base.channelMask));
@@ -319,6 +327,7 @@ public:
 
 private:
     AudioUuid impl_uuid_;
+    std::mutex lifecycle_mutex_;
     std::mutex mutex_;
     std::atomic<State> state_{State::INIT};
     std::atomic<ally::Profile> profile_{ally::Profile::Game};
@@ -328,6 +337,7 @@ private:
     std::atomic<bool> upmix_{false};
     std::atomic<bool> scene_adapter_{false};
     std::atomic<bool> auto_eq_{false};
+    bool models_paused_ = false; // controller pause, protected by mutex_
     std::atomic<bool> worker_running_{false};
     std::thread worker_;
 
@@ -355,6 +365,13 @@ private:
                 return;
             }
             int32_t val = le.get<LoudnessEnhancer::Tag::gainMb>();
+            // Commands in the unused gain-code range preserve all DSP configuration.
+            if (val == 15000 || val == 15001) {
+                models_paused_ = (val == 15001);
+                renderer_.set_models_paused(models_paused_ || state_.load() != State::PROCESSING);
+                ALOGI("model playback state: %s", models_paused_ ? "paused" : "playing");
+                return;
+            }
             if (val >= 50000 && val < 130000) {
                 const int flags = (val - 50000) / 10000;
                 scene_adapter_.store((flags & 4) != 0);
@@ -423,14 +440,16 @@ private:
     }
 
     void stop_worker() {
+        std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
         std::unique_lock<std::mutex> lock(mutex_);
         stop_worker_locked(lock);
     }
 
-    // Wake mask for incoming audio on statusMQ's event flag: covers V1 (bit 0 = 0x01)
-    // and V2/V3 (bits 2..4) while excluding FMQ_NOT_EMPTY (bit 1 = 0x02) that we wake
-    // ourselves for statusMQ->readBlocking().
-    static constexpr uint32_t kEventFlagDataMqNotEmpty = (1u << 0) | (1u << 2) | (1u << 3) | (1u << 4);
+    // AIDL EffectHalAidl signals bit 11 starting with V2 and bit 0 on V1.
+    // FMQ bit 1 (0x02) is reserved for AudioFlinger reading the status reply.
+    static constexpr uint32_t kDataReady = (1u << 11) | 1u;
+    static constexpr uint32_t kStopWorker = 1u << 31;
+    static constexpr int kIdleReleaseMs = 1500;
 
     // Joins the worker with `lock` released: the worker takes mutex_ for every block
     // and for idle accounting, so joining while holding it deadlocked close() (the
@@ -438,8 +457,7 @@ private:
     // `lock` on entry and on return.
     void stop_worker_locked(std::unique_lock<std::mutex>& lock) {
         if (worker_running_.exchange(false)) {
-            status_mq_.wake(kEventFlagDataMqNotEmpty);
-            in_mq_.wake(0x02);
+            status_mq_.wake(kStopWorker);
             std::thread worker = std::move(worker_);
             if (worker.joinable()) {
                 lock.unlock();
@@ -454,43 +472,16 @@ private:
         std::vector<float> stereo_buf;
         std::vector<float> out_buf;
         std::vector<float> mono_buf;
-        auto last_beat = std::chrono::steady_clock::now();
-
-        uint64_t stat_buffers = 0, stat_timeouts = 0, stat_wait_us = 0, stat_proc_us = 0;
-        int idle_rounds_ = 0;
+        using Clock = std::chrono::steady_clock;
+        using Milliseconds = std::chrono::milliseconds;
+        auto idle_at = Clock::time_point::max();
+        auto last_stat = Clock::now();
+        uint64_t stat_buffers = 0, stat_proc_us = 0, stat_max_us = 0;
         const char* eq_profile = "neutral";
-        auto last_stat = std::chrono::steady_clock::now();
+
         while (worker_running_.load()) {
-            auto t_wait0 = std::chrono::steady_clock::now();
-            if (in_mq_.available_to_read() < static_cast<size_t>(in_channels_)) {
-                // Wait on statusMQ's data-ready event flag (wakes immediately on V2+ HAL),
-                // with a short timeout fallback for V1 clients that wake FMQ_NOT_EMPTY.
-                const int wait_ms = idle_rounds_ < 5 ? 2 : 10;
-                status_mq_.wait(kEventFlagDataMqNotEmpty, wait_ms);
-                if (in_mq_.available_to_read() < static_cast<size_t>(in_channels_)) {
-                    stat_timeouts++;
-                    if (idle_rounds_ < 1000) idle_rounds_++;
-                    // No audio at all (paused/stopped stream): count it as silence so
-                    // the neural separator unloads instead of sitting in memory.
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    renderer_.idle(static_cast<int>(sample_rate_ * wait_ms / 1000.0f));
-                } else {
-                    idle_rounds_ = 0;
-                }
-            } else {
-                idle_rounds_ = 0;
-            }
-            auto t_proc0 = std::chrono::steady_clock::now();
+            std::unique_lock<std::mutex> lock(mutex_);
             if (!worker_running_.load()) break;
-
-            auto now_beat = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::milliseconds>(now_beat - last_beat).count() >= 2000) {
-                ALOGI("effect beat: avail_in=%d avail_out=%d frame_count=%zu state=%d",
-                      (int)in_mq_.available_to_read(), (int)out_mq_.available_to_write(),
-                      frame_count_, (int)state_.load());
-                last_beat = now_beat;
-            }
-
             // Consume the entire chunk AudioFlinger wrote: EffectHalAidl::process() checks
             // retStatus.fmqConsumed == floatsToWrite, and floatsToWrite can be smaller than
             // common.input.frameCount. Waiting for a full frame_count_ deadlocks playback.
@@ -498,9 +489,23 @@ private:
             const size_t avail_out_frames = out_mq_.available_to_write() / static_cast<size_t>(out_channels_);
             const size_t frames = std::min(avail_in_frames, avail_out_frames);
             if (frames == 0) {
+                int timeout_ms = 0; // libfmq uses zero for an indefinite wait.
+                if (idle_at != Clock::time_point::max()) {
+                    const auto now = Clock::now();
+                    if (now >= idle_at) {
+                        renderer_.release_models();
+                        idle_at = Clock::time_point::max();
+                    }
+                    if (idle_at != Clock::time_point::max()) {
+                        timeout_ms = static_cast<int>(std::chrono::ceil<Milliseconds>(idle_at - now).count());
+                    }
+                }
+                lock.unlock();
+                status_mq_.wait(kDataReady | kStopWorker, timeout_ms);
                 continue;
             }
 
+            const auto t_proc0 = Clock::now();
             in_buf.resize(frames * in_channels_);
             stereo_buf.resize(frames * 2);
             out_buf.resize(frames * out_channels_);
@@ -510,7 +515,6 @@ private:
             }
 
             if (state_.load() == State::PROCESSING) {
-                std::lock_guard<std::mutex> lock(mutex_);
                 if (in_channels_ == 1) {
                     // Mono -> duplicate to stereo for renderer
                     mono_buf.resize(frames * 2);
@@ -542,23 +546,6 @@ private:
                 out_mq_.write(out_buf.data(), frames * out_channels_);
             }
 
-            auto t_end = std::chrono::steady_clock::now();
-            stat_buffers++;
-            stat_wait_us += std::chrono::duration_cast<std::chrono::microseconds>(t_proc0 - t_wait0).count();
-            stat_proc_us += std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_proc0).count();
-            if (std::chrono::duration_cast<std::chrono::milliseconds>(t_end - last_stat).count() >= 2000) {
-                ALOGI("effect stats: buffers=%llu timeouts=%llu avg_wait=%lluus avg_proc=%lluus "
-                      "state=%d reverb=%d npu=%d upmix_active=%d scene=%d auto_eq=%d eq_profile=%s",
-                      (unsigned long long)stat_buffers, (unsigned long long)stat_timeouts,
-                      (unsigned long long)(stat_buffers ? stat_wait_us / stat_buffers : 0),
-                      (unsigned long long)(stat_buffers ? stat_proc_us / stat_buffers : 0),
-                      (int)state_.load(), (int)reverb_.load(), (int)renderer_.npu_active(),
-                      (int)renderer_.upmix_active(), (int)scene_adapter_.load(),
-                      (int)auto_eq_.load(), eq_profile);
-                stat_buffers = stat_timeouts = stat_wait_us = stat_proc_us = 0;
-                last_stat = t_end;
-            }
-
             IEffect::Status st{};
             st.status = 0; // STATUS_OK
             st.fmqConsumed = static_cast<int32_t>(frames * in_channels_);
@@ -568,6 +555,26 @@ private:
             // FMQ_NOT_EMPTY == 0x02; waking bit 1 left it blocked forever, which is the
             // frozen playback the device showed.
             status_mq_.wake(0x02);
+
+            const auto t_end = Clock::now();
+            idle_at = t_end + Milliseconds(kIdleReleaseMs);
+            const auto proc_us = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_proc0).count());
+            stat_buffers++;
+            stat_proc_us += proc_us;
+            stat_max_us = std::max(stat_max_us, proc_us);
+            if (t_end - last_stat >= std::chrono::seconds(2)) {
+                const bool npu = renderer_.npu_active(), upmix = renderer_.upmix_active();
+                lock.unlock();
+                ALOGI("effect stats: buffers=%llu avg_proc=%lluus max_proc=%lluus "
+                      "state=%d reverb=%d npu=%d upmix_active=%d scene=%d auto_eq=%d eq_profile=%s",
+                      (unsigned long long)stat_buffers,
+                      (unsigned long long)(stat_proc_us / stat_buffers),
+                      (unsigned long long)stat_max_us, (int)state_.load(), (int)reverb_.load(),
+                      (int)npu, (int)upmix, (int)scene_adapter_.load(), (int)auto_eq_.load(), eq_profile);
+                stat_buffers = stat_proc_us = stat_max_us = 0;
+                last_stat = t_end;
+            }
         }
     }
 };

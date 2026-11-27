@@ -3,6 +3,7 @@
 #include <cmath>
 #include <complex>
 #include <cstddef>
+#include <utility>
 #include <vector>
 
 namespace ally {
@@ -11,15 +12,20 @@ namespace ally {
 // Produces N/2 + 1 complex bins matching numpy.fft.rfft / irfft scaling.
 class RealFFT {
 public:
-    explicit RealFFT(size_t n) : n_(n), half_(n / 2), twiddles_(n / 2), rfft_twiddles_(n / 2) {
+    explicit RealFFT(size_t n) : n_(n), half_(n / 2), rfft_twiddles_(half_) {
         constexpr double kPi = 3.14159265358979323846;
         for (size_t k = 0; k < half_; ++k) {
             double angle = -2.0 * kPi * static_cast<double>(k) / static_cast<double>(n_);
-            twiddles_[k] = {static_cast<float>(std::cos(angle)), static_cast<float>(std::sin(angle))};
-            double rangle = -2.0 * kPi * static_cast<double>(k) / static_cast<double>(n_);
-            rfft_twiddles_[k] = {static_cast<float>(std::cos(rangle)), static_cast<float>(std::sin(rangle))};
+            rfft_twiddles_[k] = {static_cast<float>(std::cos(angle)), static_cast<float>(std::sin(angle))};
         }
         scratch_.resize(half_);
+        // Each transform uses the same permutation of the packed complex samples.
+        for (size_t i = 1, j = 0; i < half_; ++i) {
+            size_t bit = half_ >> 1;
+            for (; j & bit; bit >>= 1) j ^= bit;
+            j ^= bit;
+            if (i < j) swaps_.emplace_back(i, j);
+        }
         // Precompute half-size complex FFT twiddles
         half_twiddles_.resize(half_ / 2);
         for (size_t k = 0; k < half_ / 2; ++k) {
@@ -79,17 +85,7 @@ public:
 
 private:
     void fft_complex(std::complex<float>* data, size_t n, bool inv) const {
-        // Bit-reversal permutation
-        for (size_t i = 1, j = 0; i < n; ++i) {
-            size_t bit = n >> 1;
-            for (; j & bit; bit >>= 1) {
-                j ^= bit;
-            }
-            j ^= bit;
-            if (i < j) {
-                std::swap(data[i], data[j]);
-            }
-        }
+        for (const auto& [i, j] : swaps_) std::swap(data[i], data[j]);
         // Cooley-Tukey butterfly
         for (size_t len = 2; len <= n; len <<= 1) {
             size_t half = len >> 1;
@@ -109,7 +105,7 @@ private:
 
     size_t n_;
     size_t half_;
-    std::vector<std::complex<float>> twiddles_;
+    std::vector<std::pair<size_t, size_t>> swaps_;
     std::vector<std::complex<float>> rfft_twiddles_;
     std::vector<std::complex<float>> half_twiddles_;
     // Scratch for forward()/inverse(). Each Convolver owns its RealFFT and calls it
